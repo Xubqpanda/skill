@@ -13,6 +13,7 @@ from the tasks/ directory.
 # ///
 
 import argparse
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import json
 import logging
 import os
@@ -41,6 +42,20 @@ logging.basicConfig(
 )
 
 logger = logging.getLogger("benchmark")
+
+
+def _make_json_safe(value: Any) -> Any:
+    if isinstance(value, bytes):
+        return value.decode("utf-8", errors="replace")
+    if isinstance(value, dict):
+        return {str(k): _make_json_safe(v) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_make_json_safe(item) for item in value]
+    if isinstance(value, tuple):
+        return [_make_json_safe(item) for item in value]
+    if isinstance(value, (str, int, float, bool)) or value is None:
+        return value
+    return str(value)
 
 
 class OpenClawAgent:
@@ -213,6 +228,12 @@ def _parse_args() -> argparse.Namespace:
         help="Number of runs per task for averaging",
     )
     parser.add_argument(
+        "--parallel",
+        type=int,
+        default=1,
+        help="Number of fully isolated task runs to execute in parallel",
+    )
+    parser.add_argument(
         "--judge",
         default=None,
         help="Judge model identifier (default: openrouter/anthropic/claude-opus-4.5)",
@@ -248,6 +269,113 @@ def _next_run_id(run_root: Path) -> str:
             existing.append(int(entry.name))
     next_id = (max(existing) + 1) if existing else 1
     return f"{next_id:04d}"
+
+
+def _run_task_job(
+    *,
+    task: Task,
+    task_index: int,
+    total_tasks: int,
+    run_index: int,
+    runs_per_task: int,
+    job_index: int,
+    model: str,
+    run_id: str,
+    timeout_multiplier: float,
+    skill_dir: Path,
+    verbose: bool,
+    judge_model: Optional[str],
+) -> Dict[str, Any]:
+    logger.info("\n%s", "=" * 80)
+    logger.info(
+        "📋 Task %s/%s (Run %s/%s) [job %s]",
+        task_index,
+        total_tasks,
+        run_index + 1,
+        runs_per_task,
+        job_index,
+    )
+    logger.info("%s", "=" * 80)
+
+    model_slug = slugify_model(model)
+    agent_id = f"bench-{model_slug}-{run_id}-j{job_index:04d}"
+    agent_workspace = Path(f"/tmp/pinchbench/{run_id}/agent_workspace_j{job_index:04d}")
+    ensure_agent_exists(agent_id, model, agent_workspace)
+    cleanup_agent_sessions(agent_id)
+
+    execution_error = None
+    try:
+        result = execute_openclaw_task(
+            task=task,
+            agent_id=agent_id,
+            model_id=model,
+            run_id=f"{run_id}-r{run_index + 1}-j{job_index:04d}",
+            timeout_multiplier=timeout_multiplier,
+            skill_dir=skill_dir,
+            verbose=verbose,
+        )
+    except Exception as exc:
+        execution_error = str(exc)
+        logger.warning("Task execution failed for %s, continuing: %s", task.task_id, exc)
+        result = {
+            "agent_id": agent_id,
+            "task_id": task.task_id,
+            "status": "error",
+            "transcript": [],
+            "llm_calls": [],
+            "llm_models": [],
+            "usage": {},
+            "workspace": "",
+            "exit_code": -1,
+            "timed_out": False,
+            "execution_time": 0.0,
+            "stdout": "",
+            "stderr": execution_error,
+        }
+
+    judge_agent_prefix = f"bench-judge-{run_id}-j{job_index:04d}"
+    try:
+        grade_kwargs = dict(task=task, execution_result=result, skill_dir=skill_dir, verbose=verbose)
+        if judge_model:
+            grade_kwargs["judge_model"] = judge_model
+        grade_kwargs["judge_agent_prefix"] = judge_agent_prefix
+        grade = grade_task(**grade_kwargs)
+    except Exception as exc:
+        if execution_error:
+            note = f"Execution failed: {execution_error}; Grading failed: {exc}"
+        else:
+            note = f"Grading failed: {exc}"
+        logger.warning("Task grading failed for %s, continuing: %s", task.task_id, exc)
+        grade = GradeResult(
+            task_id=task.task_id,
+            score=0.0,
+            max_score=1.0,
+            grading_type=task.grading_type,
+            breakdown={},
+            notes=note,
+        )
+
+    score_pct = grade.score / grade.max_score * 100 if grade.max_score > 0 else 0
+    status_emoji = "✅" if grade.score >= grade.max_score else "⚠️" if grade.score > 0 else "❌"
+    logger.info(
+        "%s Task %s: %.1f/%.1f (%.0f%%) - %s",
+        status_emoji,
+        task.task_id,
+        grade.score,
+        grade.max_score,
+        score_pct,
+        grade.grading_type,
+    )
+    if grade.notes:
+        logger.info("   Notes: %s", grade.notes[:200])
+
+    return {
+        "task_id": task.task_id,
+        "task_index": task_index,
+        "run_index": run_index,
+        "result": result,
+        "grade": grade,
+    }
 
 
 def _load_ascii_art(script_dir: Path, filename: str) -> str | None:
@@ -309,6 +437,9 @@ def _compute_efficiency_summary(
     """
     total_input_tokens = 0
     total_output_tokens = 0
+    total_cache_read_tokens = 0
+    total_cache_write_tokens = 0
+    total_cache_hit_tokens = 0
     total_tokens = 0
     total_cost_usd = 0.0
     total_requests = 0
@@ -324,6 +455,9 @@ def _compute_efficiency_summary(
 
         inp = int(usage.get("input_tokens", 0))
         out = int(usage.get("output_tokens", 0))
+        cache_read = int(usage.get("cache_read_tokens", 0))
+        cache_write = int(usage.get("cache_write_tokens", 0))
+        cache_hit = int(usage.get("cache_hit_tokens", cache_read))
         tot = int(usage.get("total_tokens", 0))
         cost = float(usage.get("cost_usd", 0.0) or 0.0)
         reqs = int(usage.get("request_count", 0))
@@ -331,6 +465,9 @@ def _compute_efficiency_summary(
 
         total_input_tokens += inp
         total_output_tokens += out
+        total_cache_read_tokens += cache_read
+        total_cache_write_tokens += cache_write
+        total_cache_hit_tokens += cache_hit
         total_tokens += tot
         total_cost_usd += cost
         total_requests += reqs
@@ -343,6 +480,7 @@ def _compute_efficiency_summary(
             "task_id": task_id,
             "score": round(score, 4),
             "total_tokens": tot,
+            "cache_hit_tokens": cache_hit,
             "cost_usd": round(cost, 6),
             "tokens_per_score_point": round(tot / score, 1) if score > 0 else None,
         })
@@ -358,6 +496,9 @@ def _compute_efficiency_summary(
         "total_tokens": total_tokens,
         "total_input_tokens": total_input_tokens,
         "total_output_tokens": total_output_tokens,
+        "total_cache_read_tokens": total_cache_read_tokens,
+        "total_cache_write_tokens": total_cache_write_tokens,
+        "total_cache_hit_tokens": total_cache_hit_tokens,
         "total_cost_usd": round(total_cost_usd, 6),
         "total_requests": total_requests,
         "total_execution_time_seconds": round(total_execution_time, 2),
@@ -397,6 +538,11 @@ def _log_efficiency_summary(
         f"{efficiency['total_tokens']:,}",
         f"{efficiency['total_input_tokens']:,}",
         f"{efficiency['total_output_tokens']:,}",
+    )
+    logger.info(
+        "   Cache tokens (read/write): %s / %s",
+        f"{efficiency.get('total_cache_read_tokens', 0):,}",
+        f"{efficiency.get('total_cache_write_tokens', 0):,}",
     )
     logger.info("   Total API requests: %s", f"{efficiency['total_requests']:,}")
     if efficiency["total_cost_usd"] > 0:
@@ -556,12 +702,10 @@ def main():
     run_root = Path("/tmp/pinchbench")
     run_id = _next_run_id(run_root)
     skill_dir = skill_root
-    agent_id = f"bench-{model_slug}"
-    # Use a shared workspace for the agent - we'll copy fixtures per task
-    agent_workspace = Path(f"/tmp/pinchbench/{run_id}/agent_workspace")
-
-    ensure_agent_exists(agent_id, args.model, agent_workspace)
-    cleanup_agent_sessions(agent_id)
+    parallel_jobs = max(1, int(args.parallel or 1))
+    if parallel_jobs != args.parallel:
+        logger.warning("Invalid --parallel=%s, falling back to %s", args.parallel, parallel_jobs)
+    logger.info("Parallel isolated jobs: %s", parallel_jobs)
 
     task_ids = _select_task_ids(runner.tasks, args.suite)
     results = []
@@ -573,84 +717,114 @@ def main():
     tasks_by_id = {task.task_id: task for task in tasks_to_run}
 
     runs_per_task = max(1, args.runs)
+    jobs: List[Dict[str, Any]] = []
+    job_counter = 1
     for i, task in enumerate(tasks_to_run, 1):
-        task_grades = []
         for run_index in range(runs_per_task):
-            logger.info("\n%s", "=" * 80)
-            logger.info(
-                "📋 Task %s/%s (Run %s/%s)",
-                i,
-                len(tasks_to_run),
-                run_index + 1,
-                runs_per_task,
+            jobs.append(
+                {
+                    "task": task,
+                    "task_index": i,
+                    "run_index": run_index,
+                    "job_index": job_counter,
+                }
             )
-            logger.info("%s", "=" * 80)
-            execution_error = None
-            try:
-                result = execute_openclaw_task(
-                    task=task,
-                    agent_id=agent_id,
-                    model_id=args.model,
-                    run_id=f"{run_id}-{run_index + 1}",
+            job_counter += 1
+
+    logger.info("Scheduling %s total task runs", len(jobs))
+    completed_jobs: List[Dict[str, Any]] = []
+    if parallel_jobs == 1:
+        for job in jobs:
+            completed_jobs.append(
+                _run_task_job(
+                    task=job["task"],
+                    task_index=job["task_index"],
+                    total_tasks=len(tasks_to_run),
+                    run_index=job["run_index"],
+                    runs_per_task=runs_per_task,
+                    job_index=job["job_index"],
+                    model=args.model,
+                    run_id=run_id,
                     timeout_multiplier=args.timeout_multiplier,
                     skill_dir=skill_dir,
                     verbose=args.verbose,
+                    judge_model=args.judge,
                 )
-            except Exception as exc:
-                execution_error = str(exc)
-                logger.warning("Task execution failed for %s, continuing: %s", task.task_id, exc)
-                result = {
-                    "agent_id": agent_id,
-                    "task_id": task.task_id,
-                    "status": "error",
-                    "transcript": [],
-                    "usage": {},
-                    "workspace": "",
-                    "exit_code": -1,
-                    "timed_out": False,
-                    "execution_time": 0.0,
-                    "stdout": "",
-                    "stderr": execution_error,
-                }
-            try:
-                grade_kwargs = dict(task=task, execution_result=result, skill_dir=skill_dir, verbose=args.verbose)
-                if args.judge:
-                    grade_kwargs["judge_model"] = args.judge
-                grade = grade_task(**grade_kwargs)
-            except Exception as exc:
-                if execution_error:
-                    note = f"Execution failed: {execution_error}; Grading failed: {exc}"
-                else:
-                    note = f"Grading failed: {exc}"
-                logger.warning("Task grading failed for %s, continuing: %s", task.task_id, exc)
-                grade = GradeResult(
-                    task_id=task.task_id,
-                    score=0.0,
-                    max_score=1.0,
-                    grading_type=task.grading_type,
-                    breakdown={},
-                    notes=note,
-                )
-            task_grades.append(grade)
-            results.append(result)
-
-            # Log score immediately after grading
-            score_pct = grade.score / grade.max_score * 100 if grade.max_score > 0 else 0
-            status_emoji = (
-                "✅" if grade.score >= grade.max_score else "⚠️" if grade.score > 0 else "❌"
             )
-            logger.info(
-                "%s Task %s: %.1f/%.1f (%.0f%%) - %s",
-                status_emoji,
-                task.task_id,
-                grade.score,
-                grade.max_score,
-                score_pct,
-                grade.grading_type,
-            )
-            if grade.notes:
-                logger.info("   Notes: %s", grade.notes[:200])
+    else:
+        with ThreadPoolExecutor(max_workers=parallel_jobs) as executor:
+            futures = {
+                executor.submit(
+                    _run_task_job,
+                    task=job["task"],
+                    task_index=job["task_index"],
+                    total_tasks=len(tasks_to_run),
+                    run_index=job["run_index"],
+                    runs_per_task=runs_per_task,
+                    job_index=job["job_index"],
+                    model=args.model,
+                    run_id=run_id,
+                    timeout_multiplier=args.timeout_multiplier,
+                    skill_dir=skill_dir,
+                    verbose=args.verbose,
+                    judge_model=args.judge,
+                ): job
+                for job in jobs
+            }
+            for future in as_completed(futures):
+                job = futures[future]
+                try:
+                    completed_jobs.append(future.result())
+                except Exception as exc:
+                    task = job["task"]
+                    logger.warning("Task execution crashed for %s, continuing: %s", task.task_id, exc)
+                    fallback_grade = GradeResult(
+                        task_id=task.task_id,
+                        score=0.0,
+                        max_score=1.0,
+                        grading_type=task.grading_type,
+                        breakdown={},
+                        notes=f"Parallel worker crashed: {exc}",
+                    )
+                    completed_jobs.append(
+                        {
+                            "task_id": task.task_id,
+                            "task_index": job["task_index"],
+                            "run_index": job["run_index"],
+                            "result": {
+                                "agent_id": "",
+                                "task_id": task.task_id,
+                                "status": "error",
+                                "transcript": [],
+                                "llm_calls": [],
+                                "llm_models": [],
+                                "usage": {},
+                                "workspace": "",
+                                "exit_code": -1,
+                                "timed_out": False,
+                                "execution_time": 0.0,
+                                "stdout": "",
+                                "stderr": str(exc),
+                            },
+                            "grade": fallback_grade,
+                        }
+                    )
 
+    completed_jobs.sort(key=lambda item: (int(item["task_index"]), int(item["run_index"])))
+    results = [job["result"] for job in completed_jobs]
+
+    for i, task in enumerate(tasks_to_run, 1):
+        task_runs = [job for job in completed_jobs if job["task_id"] == task.task_id]
+        if not task_runs:
+            grades_by_task_id[task.task_id] = {
+                "runs": [],
+                "mean": 0.0,
+                "std": 0.0,
+                "min": 0.0,
+                "max": 0.0,
+            }
+            continue
+        task_grades = [job["grade"] for job in task_runs]
         task_scores = [grade.score for grade in task_grades]
         grades_by_task_id[task.task_id] = {
             "runs": [grade.to_dict() for grade in task_grades],
@@ -670,8 +844,13 @@ def main():
             "timed_out": result["timed_out"],
             "execution_time": result["execution_time"],
             "transcript_length": len(result["transcript"]),
+            "transcript": result["transcript"],
+            "llm_calls": result.get("llm_calls", []),
+            "llm_models": result.get("llm_models", []),
             "usage": result.get("usage", {}),
             "workspace": result["workspace"],
+            "stdout": result.get("stdout", ""),
+            "stderr": result.get("stderr", ""),
             "grading": grades_by_task_id[result["task_id"]],
             "frontmatter": tasks_by_id[result["task_id"]].frontmatter,
         }
@@ -692,7 +871,8 @@ def main():
     }
 
     output_path = output_dir / f"{run_id}_{model_slug}.json"
-    output_path.write_text(json.dumps(aggregate, indent=2), encoding="utf-8")
+    safe_aggregate = _make_json_safe(aggregate)
+    output_path.write_text(json.dumps(safe_aggregate, indent=2), encoding="utf-8")
 
     logger.info("Saved results to %s", output_path)
     _log_category_summary(task_entries, tasks_by_id)

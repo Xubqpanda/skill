@@ -23,6 +23,14 @@ def slugify_model(model_id: str) -> str:
     return model_id.replace("/", "-").replace(".", "-").lower()
 
 
+def _ensure_text(value: Any) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, bytes):
+        return value.decode("utf-8", errors="replace")
+    return str(value)
+
+
 
 def _get_agent_workspace(agent_id: str) -> Path | None:
     """Get the workspace path for an agent from OpenClaw config."""
@@ -358,11 +366,28 @@ def _load_transcript(agent_id: str, session_id: str, started_at: float) -> List[
 
 def _extract_usage_from_transcript(transcript: List[Dict[str, Any]]) -> Dict[str, Any]:
     """Sum token usage and cost from all assistant messages in transcript."""
+    def _to_int(value: Any, default: int = 0) -> int:
+        try:
+            if value is None:
+                return default
+            return int(value)
+        except (TypeError, ValueError):
+            return default
+
+    def _to_float(value: Any, default: float = 0.0) -> float:
+        try:
+            if value is None:
+                return default
+            return float(value)
+        except (TypeError, ValueError):
+            return default
+
     totals = {
         "input_tokens": 0,
         "output_tokens": 0,
         "cache_read_tokens": 0,
         "cache_write_tokens": 0,
+        "cache_hit_tokens": 0,
         "total_tokens": 0,
         "cost_usd": 0.0,
         "request_count": 0,
@@ -376,15 +401,92 @@ def _extract_usage_from_transcript(transcript: List[Dict[str, Any]]) -> Dict[str
             continue
         totals["request_count"] += 1
         usage = msg.get("usage", {})
-        totals["input_tokens"] += usage.get("input", 0)
-        totals["output_tokens"] += usage.get("output", 0)
-        totals["cache_read_tokens"] += usage.get("cacheRead", 0)
-        totals["cache_write_tokens"] += usage.get("cacheWrite", 0)
-        totals["total_tokens"] += usage.get("totalTokens", 0)
+
+        input_tokens = _to_int(usage.get("input"), _to_int(usage.get("input_tokens"), _to_int(usage.get("prompt_tokens"), 0)))
+        output_tokens = _to_int(usage.get("output"), _to_int(usage.get("output_tokens"), _to_int(usage.get("completion_tokens"), 0)))
+
+        # Cross-provider cache fields:
+        # - OpenClaw transcript style: cacheRead/cacheWrite
+        # - Anthropic style: cache_read_input_tokens/cache_creation_input_tokens
+        # - OpenAI style: prompt_tokens_details.cached_tokens
+        cached_tokens = _to_int(
+            usage.get("cachedTokens"),
+            _to_int(
+                usage.get("cached_tokens"),
+                _to_int((usage.get("prompt_tokens_details") or {}).get("cached_tokens"), 0),
+            ),
+        )
+        cache_read_tokens = _to_int(
+            usage.get("cacheRead"),
+            _to_int(
+                usage.get("cache_read_tokens"),
+                _to_int(usage.get("cache_read_input_tokens"), cached_tokens),
+            ),
+        )
+        cache_write_tokens = _to_int(
+            usage.get("cacheWrite"),
+            _to_int(usage.get("cache_write_tokens"), _to_int(usage.get("cache_creation_input_tokens"), 0)),
+        )
+        total_tokens = _to_int(
+            usage.get("totalTokens"),
+            _to_int(usage.get("total_tokens"), input_tokens + output_tokens),
+        )
+
+        totals["input_tokens"] += input_tokens
+        totals["output_tokens"] += output_tokens
+        totals["cache_read_tokens"] += cache_read_tokens
+        totals["cache_write_tokens"] += cache_write_tokens
+        totals["cache_hit_tokens"] += cache_read_tokens
+        totals["total_tokens"] += total_tokens
         cost = usage.get("cost", {})
-        totals["cost_usd"] += cost.get("total", 0.0)
+        totals["cost_usd"] += _to_float(cost.get("total"), _to_float(usage.get("cost_usd"), 0.0))
 
     return totals
+
+
+def _extract_llm_calls_from_transcript(transcript: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Extract per-assistant-message LLM call metadata for debugging and audit."""
+    def _to_int(value: Any, default: int = 0) -> int:
+        try:
+            if value is None:
+                return default
+            return int(value)
+        except (TypeError, ValueError):
+            return default
+
+    def _to_float(value: Any, default: float = 0.0) -> float:
+        try:
+            if value is None:
+                return default
+            return float(value)
+        except (TypeError, ValueError):
+            return default
+
+    calls: List[Dict[str, Any]] = []
+    for idx, entry in enumerate(transcript):
+        if entry.get("type") != "message":
+            continue
+        msg = entry.get("message", {})
+        if msg.get("role") != "assistant":
+            continue
+
+        usage = msg.get("usage", {}) if isinstance(msg.get("usage"), dict) else {}
+        cost_obj = usage.get("cost", {}) if isinstance(usage.get("cost"), dict) else {}
+        calls.append({
+            "index": idx,
+            "timestamp": msg.get("timestamp") or entry.get("timestamp"),
+            "provider": msg.get("provider"),
+            "model": msg.get("model"),
+            "api": msg.get("api"),
+            "stop_reason": msg.get("stopReason"),
+            "input_tokens": _to_int(usage.get("input"), _to_int(usage.get("input_tokens"), _to_int(usage.get("prompt_tokens"), 0))),
+            "output_tokens": _to_int(usage.get("output"), _to_int(usage.get("output_tokens"), _to_int(usage.get("completion_tokens"), 0))),
+            "cache_read_tokens": _to_int(usage.get("cacheRead"), _to_int(usage.get("cache_read_tokens"), _to_int(usage.get("cache_read_input_tokens"), 0))),
+            "cache_write_tokens": _to_int(usage.get("cacheWrite"), _to_int(usage.get("cache_write_tokens"), _to_int(usage.get("cache_creation_input_tokens"), 0))),
+            "total_tokens": _to_int(usage.get("totalTokens"), _to_int(usage.get("total_tokens"), 0)),
+            "cost_usd": _to_float(cost_obj.get("total"), _to_float(usage.get("cost_usd"), 0.0)),
+        })
+    return calls
 
 
 def execute_openclaw_task(
@@ -441,13 +543,14 @@ def execute_openclaw_task(
         exit_code = result.returncode
     except subprocess.TimeoutExpired as exc:
         timed_out = True
-        stdout = exc.stdout or ""
-        stderr = exc.stderr or ""
+        stdout = _ensure_text(exc.stdout)
+        stderr = _ensure_text(exc.stderr)
     except FileNotFoundError as exc:
         stderr = f"openclaw command not found: {exc}"
 
     transcript = _load_transcript(agent_id, session_id, start_time)
     usage = _extract_usage_from_transcript(transcript)
+    llm_calls = _extract_llm_calls_from_transcript(transcript)
     execution_time = time.time() - start_time
 
     status = "success"
@@ -501,6 +604,8 @@ def execute_openclaw_task(
         "task_id": task.task_id,
         "status": status,
         "transcript": transcript,
+        "llm_calls": llm_calls,
+        "llm_models": sorted({str(call.get("model")) for call in llm_calls if call.get("model")}),
         "usage": usage,
         "workspace": str(workspace),
         "exit_code": exit_code,
@@ -585,8 +690,8 @@ def run_openclaw_prompt(
                 break
         except subprocess.TimeoutExpired as exc:
             timed_out = True
-            stdout += exc.stdout or ""
-            stderr += exc.stderr or ""
+            stdout += _ensure_text(exc.stdout)
+            stderr += _ensure_text(exc.stderr)
             break
         except FileNotFoundError as exc:
             stderr += f"openclaw command not found: {exc}"
