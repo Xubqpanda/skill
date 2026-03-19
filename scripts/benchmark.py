@@ -443,6 +443,8 @@ def _compute_efficiency_summary(
     total_tokens = 0
     total_cost_usd = 0.0
     total_requests = 0
+    total_usage_available_requests = 0
+    total_usage_missing_requests = 0
     total_execution_time = 0.0
     tasks_with_usage = 0
 
@@ -461,6 +463,8 @@ def _compute_efficiency_summary(
         tot = int(usage.get("total_tokens", 0))
         cost = float(usage.get("cost_usd", 0.0) or 0.0)
         reqs = int(usage.get("request_count", 0))
+        usage_available_reqs = int(usage.get("usage_available_count", 0))
+        usage_missing_reqs = int(usage.get("usage_missing_count", 0))
         exec_time = float(entry.get("execution_time", 0.0) or 0.0)
 
         total_input_tokens += inp
@@ -471,6 +475,8 @@ def _compute_efficiency_summary(
         total_tokens += tot
         total_cost_usd += cost
         total_requests += reqs
+        total_usage_available_requests += usage_available_reqs
+        total_usage_missing_requests += usage_missing_reqs
         total_execution_time += exec_time
 
         if tot > 0:
@@ -501,6 +507,8 @@ def _compute_efficiency_summary(
         "total_cache_hit_tokens": total_cache_hit_tokens,
         "total_cost_usd": round(total_cost_usd, 6),
         "total_requests": total_requests,
+        "usage_available_requests": total_usage_available_requests,
+        "usage_missing_requests": total_usage_missing_requests,
         "total_execution_time_seconds": round(total_execution_time, 2),
         "tasks_with_usage_data": tasks_with_usage,
         "tokens_per_task": round(total_tokens / num_tasks, 1) if num_tasks > 0 else 0,
@@ -545,6 +553,12 @@ def _log_efficiency_summary(
         f"{efficiency.get('total_cache_write_tokens', 0):,}",
     )
     logger.info("   Total API requests: %s", f"{efficiency['total_requests']:,}")
+    if efficiency.get("usage_missing_requests", 0) > 0:
+        logger.warning(
+            "   Usage unavailable for %s/%s requests (provider returned missing/zero token usage).",
+            f"{efficiency.get('usage_missing_requests', 0):,}",
+            f"{efficiency.get('total_requests', 0):,}",
+        )
     if efficiency["total_cost_usd"] > 0:
         logger.info("   Total cost: $%.4f", efficiency["total_cost_usd"])
     logger.info(

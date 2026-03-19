@@ -391,6 +391,8 @@ def _extract_usage_from_transcript(transcript: List[Dict[str, Any]]) -> Dict[str
         "total_tokens": 0,
         "cost_usd": 0.0,
         "request_count": 0,
+        "usage_available_count": 0,
+        "usage_missing_count": 0,
     }
 
     for entry in transcript:
@@ -400,10 +402,17 @@ def _extract_usage_from_transcript(transcript: List[Dict[str, Any]]) -> Dict[str
         if msg.get("role") != "assistant":
             continue
         totals["request_count"] += 1
-        usage = msg.get("usage", {})
+        usage = msg.get("usage", {}) if isinstance(msg.get("usage"), dict) else {}
+        provider_raw = usage.get("providerRaw", {})
+        if not isinstance(provider_raw, dict):
+            provider_raw = {}
 
         input_tokens = _to_int(usage.get("input"), _to_int(usage.get("input_tokens"), _to_int(usage.get("prompt_tokens"), 0)))
         output_tokens = _to_int(usage.get("output"), _to_int(usage.get("output_tokens"), _to_int(usage.get("completion_tokens"), 0)))
+        if input_tokens == 0:
+            input_tokens = _to_int(provider_raw.get("input_tokens"), _to_int(provider_raw.get("prompt_tokens"), 0))
+        if output_tokens == 0:
+            output_tokens = _to_int(provider_raw.get("output_tokens"), _to_int(provider_raw.get("completion_tokens"), 0))
 
         # Cross-provider cache fields:
         # - OpenClaw transcript style: cacheRead/cacheWrite
@@ -431,6 +440,8 @@ def _extract_usage_from_transcript(transcript: List[Dict[str, Any]]) -> Dict[str
             usage.get("totalTokens"),
             _to_int(usage.get("total_tokens"), input_tokens + output_tokens),
         )
+        if total_tokens == 0:
+            total_tokens = _to_int(provider_raw.get("total_tokens"), input_tokens + output_tokens)
 
         totals["input_tokens"] += input_tokens
         totals["output_tokens"] += output_tokens
@@ -440,6 +451,10 @@ def _extract_usage_from_transcript(transcript: List[Dict[str, Any]]) -> Dict[str
         totals["total_tokens"] += total_tokens
         cost = usage.get("cost", {})
         totals["cost_usd"] += _to_float(cost.get("total"), _to_float(usage.get("cost_usd"), 0.0))
+        if input_tokens > 0 or output_tokens > 0 or total_tokens > 0:
+            totals["usage_available_count"] += 1
+        else:
+            totals["usage_missing_count"] += 1
 
     return totals
 
