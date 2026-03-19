@@ -312,6 +312,7 @@ def _run_task_job(
             run_id=f"{run_id}-r{run_index + 1}-j{job_index:04d}",
             timeout_multiplier=timeout_multiplier,
             skill_dir=skill_dir,
+            agent_workspace=agent_workspace,
             verbose=verbose,
         )
     except Exception as exc:

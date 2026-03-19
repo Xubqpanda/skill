@@ -5,8 +5,10 @@ OpenClaw agent execution helpers for PinchBench.
 from __future__ import annotations
 
 import json
+import hashlib
 import logging
 import os
+import re
 import subprocess
 import time
 from pathlib import Path
@@ -17,6 +19,8 @@ from lib_tasks import Task
 
 logger = logging.getLogger(__name__)
 MAX_OPENCLAW_MESSAGE_CHARS = int(os.environ.get("PINCHBENCH_MAX_MSG_CHARS", "4000"))
+CONTEXT_HASH_PREFIX_CHARS = int(os.environ.get("PINCHBENCH_CONTEXT_HASH_PREFIX_CHARS", "1024"))
+CONTEXT_RECENT_MESSAGES = int(os.environ.get("PINCHBENCH_CONTEXT_RECENT_MESSAGES", "4"))
 
 
 def slugify_model(model_id: str) -> str:
@@ -29,6 +33,91 @@ def _ensure_text(value: Any) -> str:
     if isinstance(value, bytes):
         return value.decode("utf-8", errors="replace")
     return str(value)
+
+
+def _message_content_to_text(content: Any) -> str:
+    if content is None:
+        return ""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, bytes):
+        return content.decode("utf-8", errors="replace")
+    if isinstance(content, list):
+        parts: List[str] = []
+        for item in content:
+            if isinstance(item, dict):
+                # Keep this generic: capture common payload fields without
+                # assuming one provider schema.
+                item_type = item.get("type")
+                if item_type:
+                    parts.append(f"[{item_type}]")
+                for key in ("text", "content", "input", "output", "result", "value"):
+                    if key in item:
+                        parts.append(_message_content_to_text(item.get(key)))
+            else:
+                parts.append(_message_content_to_text(item))
+        return "\n".join([p for p in parts if p])
+    if isinstance(content, dict):
+        try:
+            return json.dumps(content, ensure_ascii=False, sort_keys=True)
+        except TypeError:
+            return str(content)
+    return str(content)
+
+
+def _normalize_cache_signature_text(text: str) -> str:
+    normalized = text
+    normalized = re.sub(r"\b[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\b", "<UUID>", normalized, flags=re.IGNORECASE)
+    normalized = re.sub(r"/tmp/pinchbench/[^\s\"']+", "/tmp/pinchbench/<PATH>", normalized)
+    normalized = re.sub(r"\b\d{4}-\d{2}-\d{2}[T ][0-9:\.\+\-Z]{6,}\b", "<TIMESTAMP>", normalized)
+    normalized = re.sub(r"\b\d{10,}\b", "<LONGNUM>", normalized)
+    normalized = re.sub(r"\s+", " ", normalized).strip()
+    return normalized
+
+
+def _sha256_text(value: str) -> str:
+    return hashlib.sha256(value.encode("utf-8", errors="replace")).hexdigest()
+
+
+def _build_call_context_detail(
+    transcript: List[Dict[str, Any]],
+    assistant_entry_index: int,
+) -> Dict[str, Any]:
+    message_items: List[Dict[str, Any]] = []
+    message_indices: List[int] = []
+    for idx, entry in enumerate(transcript[:assistant_entry_index]):
+        if entry.get("type") != "message":
+            continue
+        msg = entry.get("message", {}) if isinstance(entry.get("message"), dict) else {}
+        role = str(msg.get("role") or "unknown")
+        content_text = _message_content_to_text(msg.get("content"))
+        message_items.append(
+            {
+                "transcript_index": idx,
+                "role": role,
+                "content": content_text,
+            }
+        )
+        message_indices.append(idx)
+
+    signature_payload = json.dumps(message_items, ensure_ascii=False, sort_keys=True)
+    normalized_payload = _normalize_cache_signature_text(signature_payload)
+    prefix_chars = max(128, CONTEXT_HASH_PREFIX_CHARS)
+    recent_count = max(1, CONTEXT_RECENT_MESSAGES)
+    recent_messages = message_items[-recent_count:]
+
+    return {
+        "assistant_transcript_index": assistant_entry_index,
+        "context_message_count": len(message_items),
+        "context_message_indices": message_indices,
+        "context_chars": len(signature_payload),
+        "context_signature_sha256": _sha256_text(signature_payload),
+        "context_signature_normalized_sha256": _sha256_text(normalized_payload),
+        "prefix_chars": prefix_chars,
+        "prefix_signature_sha256": _sha256_text(signature_payload[:prefix_chars]),
+        "prefix_signature_normalized_sha256": _sha256_text(normalized_payload[:prefix_chars]),
+        "recent_messages": recent_messages,
+    }
 
 
 
@@ -180,15 +269,24 @@ def cleanup_agent_sessions(agent_id: str) -> None:
         logger.info("Removed %s old OpenClaw session transcripts for %s", removed, agent_id)
 
 
-def prepare_task_workspace(skill_dir: Path, run_id: str, task: Task, agent_id: str) -> Path:
+def prepare_task_workspace(
+    skill_dir: Path,
+    run_id: str,
+    task: Task,
+    agent_id: str,
+    workspace_override: Path | None = None,
+) -> Path:
     """
     Prepare workspace for a task by copying fixtures.
     Uses the agent's configured workspace to ensure files are in the right place.
     """
     import shutil
 
-    # Get agent's workspace from agent config
-    workspace = _get_agent_workspace(agent_id)
+    # Prefer explicit workspace from caller (parallel-safe).
+    workspace = workspace_override
+    if workspace is None:
+        # Get agent's workspace from agent config
+        workspace = _get_agent_workspace(agent_id)
     if workspace is None:
         # Fallback to task-specific workspace if agent workspace not found
         logger.warning("Could not find agent workspace, using fallback")
@@ -487,6 +585,7 @@ def _extract_llm_calls_from_transcript(transcript: List[Dict[str, Any]]) -> List
 
         usage = msg.get("usage", {}) if isinstance(msg.get("usage"), dict) else {}
         cost_obj = usage.get("cost", {}) if isinstance(usage.get("cost"), dict) else {}
+        context_detail = _build_call_context_detail(transcript, idx)
         calls.append({
             "index": idx,
             "timestamp": msg.get("timestamp") or entry.get("timestamp"),
@@ -500,6 +599,7 @@ def _extract_llm_calls_from_transcript(transcript: List[Dict[str, Any]]) -> List
             "cache_write_tokens": _to_int(usage.get("cacheWrite"), _to_int(usage.get("cache_write_tokens"), _to_int(usage.get("cache_creation_input_tokens"), 0))),
             "total_tokens": _to_int(usage.get("totalTokens"), _to_int(usage.get("total_tokens"), 0)),
             "cost_usd": _to_float(cost_obj.get("total"), _to_float(usage.get("cost_usd"), 0.0)),
+            "context_detail": context_detail,
         })
     return calls
 
@@ -512,6 +612,7 @@ def execute_openclaw_task(
     run_id: str,
     timeout_multiplier: float,
     skill_dir: Path,
+    agent_workspace: Path | None = None,
     verbose: bool = False,
 ) -> Dict[str, Any]:
     logger.info("🤖 Agent [%s] starting task: %s", agent_id, task.task_id)
@@ -527,7 +628,13 @@ def execute_openclaw_task(
     cleanup_agent_sessions(agent_id)
 
     start_time = time.time()
-    workspace = prepare_task_workspace(skill_dir, run_id, task, agent_id)
+    workspace = prepare_task_workspace(
+        skill_dir=skill_dir,
+        run_id=run_id,
+        task=task,
+        agent_id=agent_id,
+        workspace_override=agent_workspace,
+    )
     session_id = f"{task.task_id}_{int(time.time() * 1000)}"
     timeout_seconds = task.timeout_seconds * timeout_multiplier
     stdout = ""
@@ -535,35 +642,68 @@ def execute_openclaw_task(
     exit_code = -1
     timed_out = False
 
-    try:
-        result = subprocess.run(
-            [
-                "openclaw",
-                "agent",
-                "--agent",
-                agent_id,
-                "--session-id",
-                session_id,
-                "--message",
-                task.prompt,
-            ],
-            capture_output=True,
-            text=True,
-            cwd=str(workspace),
-            timeout=timeout_seconds,
-            check=False,
-        )
-        stdout = result.stdout
-        stderr = result.stderr
-        exit_code = result.returncode
-    except subprocess.TimeoutExpired as exc:
-        timed_out = True
-        stdout = _ensure_text(exc.stdout)
-        stderr = _ensure_text(exc.stderr)
-    except FileNotFoundError as exc:
-        stderr = f"openclaw command not found: {exc}"
+    def _run_once(current_session_id: str, current_timeout_seconds: float) -> tuple[str, str, int, bool]:
+        run_stdout = ""
+        run_stderr = ""
+        run_exit_code = -1
+        run_timed_out = False
+        try:
+            result = subprocess.run(
+                [
+                    "openclaw",
+                    "agent",
+                    "--agent",
+                    agent_id,
+                    "--session-id",
+                    current_session_id,
+                    "--message",
+                    task.prompt,
+                ],
+                capture_output=True,
+                text=True,
+                cwd=str(workspace),
+                timeout=current_timeout_seconds,
+                check=False,
+            )
+            run_stdout = result.stdout
+            run_stderr = result.stderr
+            run_exit_code = result.returncode
+        except subprocess.TimeoutExpired as exc:
+            run_timed_out = True
+            run_stdout = _ensure_text(exc.stdout)
+            run_stderr = _ensure_text(exc.stderr)
+        except FileNotFoundError as exc:
+            run_stderr = f"openclaw command not found: {exc}"
+        return run_stdout, run_stderr, run_exit_code, run_timed_out
+
+    stdout, stderr, exit_code, timed_out = _run_once(session_id, timeout_seconds)
 
     transcript = _load_transcript(agent_id, session_id, start_time)
+
+    # Parallel runs occasionally race with transcript persistence. Retry once
+    # to reduce false negatives when execution succeeded but transcript is empty.
+    if (
+        not transcript
+        and not timed_out
+        and exit_code in (0, -1)
+        and "openclaw command not found" not in str(stderr)
+    ):
+        logger.warning(
+            "Empty transcript for %s; retrying task execution once (session sync fallback).",
+            task.task_id,
+        )
+        cleanup_agent_sessions(agent_id)
+        retry_session_id = f"{session_id}_retry"
+        retry_started_at = time.time()
+        retry_stdout, retry_stderr, retry_exit_code, retry_timed_out = _run_once(
+            retry_session_id, timeout_seconds
+        )
+        stdout = f"{stdout}\n{retry_stdout}".strip() if stdout else retry_stdout
+        stderr = f"{stderr}\n{retry_stderr}".strip() if stderr else retry_stderr
+        exit_code = retry_exit_code
+        timed_out = retry_timed_out
+        transcript = _load_transcript(agent_id, retry_session_id, retry_started_at)
+
     usage = _extract_usage_from_transcript(transcript)
     llm_calls = _extract_llm_calls_from_transcript(transcript)
     execution_time = time.time() - start_time
