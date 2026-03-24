@@ -384,6 +384,19 @@ def _find_recent_session_path(agent_dir: Path, started_at: float) -> Path | None
     return max(pool, key=lambda path: path.stat().st_mtime)
 
 
+def _wait_for_transcript_unlock(transcript_path: Path, max_wait_seconds: float = 12.0) -> None:
+    """
+    Wait until the transcript lock file disappears.
+
+    OpenClaw writes transcript as <uuid>.jsonl while holding <uuid>.jsonl.lock.
+    Reading too early can race with writer and yield false negatives.
+    """
+    lock_path = transcript_path.with_name(f"{transcript_path.name}.lock")
+    deadline = time.time() + max_wait_seconds
+    while lock_path.exists() and time.time() < deadline:
+        time.sleep(0.2)
+
+
 def _load_transcript(agent_id: str, session_id: str, started_at: float) -> List[Dict[str, Any]]:
     agent_dir = _get_agent_store_dir(agent_id)
     transcript_path = None
@@ -395,7 +408,11 @@ def _load_transcript(agent_id: str, session_id: str, started_at: float) -> List[
     #   1. Resolve the real session ID from sessions.json
     #   2. Glob for any .jsonl in the sessions dir (most-recently-modified)
     #   3. Try our passed-in session ID as a last resort
-    for attempt in range(6):
+    # Two-phase wait:
+    # - discovery retries (existing behavior)
+    # - if lock files are present but jsonl is not yet visible, allow extra wait
+    max_attempts = 10
+    for attempt in range(max_attempts):
         # 1. Try sessions.json first — OpenClaw writes the real UUID here
         resolved_session_id = _resolve_session_id_from_store(agent_id)
         if resolved_session_id:
@@ -431,13 +448,27 @@ def _load_transcript(agent_id: str, session_id: str, started_at: float) -> List[
             )
             break
 
-        if attempt < 5:
+        if attempt < (max_attempts - 1):
             time.sleep(1.0)
 
     if transcript_path is None:
         sessions_dir = agent_dir / "sessions"
         if sessions_dir.exists():
             all_files = list(sessions_dir.iterdir())
+            lock_files = [f for f in all_files if f.name.endswith(".jsonl.lock")]
+            if lock_files:
+                logger.info(
+                    "Transcript still locked for agent %s (%s lock files); waiting briefly before final check.",
+                    agent_id,
+                    len(lock_files),
+                )
+                time.sleep(2.0)
+                recent_path = _find_recent_session_path(agent_dir, started_at)
+                if recent_path is not None:
+                    transcript_path = recent_path
+                    logger.info("Found transcript after lock wait: %s", recent_path.name)
+            all_files = list(sessions_dir.iterdir())
+        if transcript_path is None and sessions_dir.exists():
             logger.warning(
                 "Transcript not found for agent %s. Sessions dir contents: %s",
                 agent_id,
@@ -449,6 +480,8 @@ def _load_transcript(agent_id: str, session_id: str, started_at: float) -> List[
                 sessions_dir,
             )
         return []
+
+    _wait_for_transcript_unlock(transcript_path)
 
     transcript: List[Dict[str, Any]] = []
     for line in transcript_path.read_text(encoding="utf-8").splitlines():
