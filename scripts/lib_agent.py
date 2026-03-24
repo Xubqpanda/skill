@@ -397,6 +397,36 @@ def _wait_for_transcript_unlock(transcript_path: Path, max_wait_seconds: float =
         time.sleep(0.2)
 
 
+def _wait_for_transcript_appearance(
+    agent_dir: Path,
+    session_id: str,
+    started_at: float,
+    max_wait_seconds: float = 30.0,
+) -> Path | None:
+    """
+    Wait for transcript file to appear when session lock exists.
+
+    In some runs OpenClaw may keep <uuid>.jsonl.lock for several seconds before
+    the corresponding .jsonl becomes visible, so a short single sleep is brittle.
+    """
+    deadline = time.time() + max_wait_seconds
+    sessions_dir = agent_dir / "sessions"
+    while time.time() < deadline:
+        resolved_session_id = _resolve_session_id_from_store(agent_dir.name)
+        if resolved_session_id:
+            candidate = sessions_dir / f"{resolved_session_id}.jsonl"
+            if candidate.exists():
+                return candidate
+        recent_path = _find_recent_session_path(agent_dir, started_at)
+        if recent_path is not None:
+            return recent_path
+        direct_path = sessions_dir / f"{session_id}.jsonl"
+        if direct_path.exists():
+            return direct_path
+        time.sleep(0.5)
+    return None
+
+
 def _load_transcript(agent_id: str, session_id: str, started_at: float) -> List[Dict[str, Any]]:
     agent_dir = _get_agent_store_dir(agent_id)
     transcript_path = None
@@ -458,15 +488,19 @@ def _load_transcript(agent_id: str, session_id: str, started_at: float) -> List[
             lock_files = [f for f in all_files if f.name.endswith(".jsonl.lock")]
             if lock_files:
                 logger.info(
-                    "Transcript still locked for agent %s (%s lock files); waiting briefly before final check.",
+                    "Transcript still locked for agent %s (%s lock files); waiting for transcript file.",
                     agent_id,
                     len(lock_files),
                 )
-                time.sleep(2.0)
-                recent_path = _find_recent_session_path(agent_dir, started_at)
-                if recent_path is not None:
-                    transcript_path = recent_path
-                    logger.info("Found transcript after lock wait: %s", recent_path.name)
+                waited_path = _wait_for_transcript_appearance(
+                    agent_dir,
+                    session_id,
+                    started_at,
+                    max_wait_seconds=30.0,
+                )
+                if waited_path is not None:
+                    transcript_path = waited_path
+                    logger.info("Found transcript after lock wait: %s", waited_path.name)
             all_files = list(sessions_dir.iterdir())
         if transcript_path is None and sessions_dir.exists():
             logger.warning(
