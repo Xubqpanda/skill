@@ -515,12 +515,19 @@ def _extract_usage_from_transcript(transcript: List[Dict[str, Any]]) -> Dict[str
         # Cross-provider cache fields:
         # - OpenClaw transcript style: cacheRead/cacheWrite
         # - Anthropic style: cache_read_input_tokens/cache_creation_input_tokens
-        # - OpenAI style: prompt_tokens_details.cached_tokens
+        # - OpenAI style: input_tokens_details.cached_tokens / prompt_tokens_details.cached_tokens
+        provider_raw_cached_tokens = _to_int(
+            (provider_raw.get("input_tokens_details") or {}).get("cached_tokens"),
+            _to_int((provider_raw.get("prompt_tokens_details") or {}).get("cached_tokens"), 0),
+        )
         cached_tokens = _to_int(
             usage.get("cachedTokens"),
             _to_int(
                 usage.get("cached_tokens"),
-                _to_int((usage.get("prompt_tokens_details") or {}).get("cached_tokens"), 0),
+                _to_int(
+                    (usage.get("input_tokens_details") or {}).get("cached_tokens"),
+                    _to_int((usage.get("prompt_tokens_details") or {}).get("cached_tokens"), provider_raw_cached_tokens),
+                ),
             ),
         )
         cache_read_tokens = _to_int(
@@ -584,6 +591,21 @@ def _extract_llm_calls_from_transcript(transcript: List[Dict[str, Any]]) -> List
             continue
 
         usage = msg.get("usage", {}) if isinstance(msg.get("usage"), dict) else {}
+        provider_raw = usage.get("providerRaw", {}) if isinstance(usage.get("providerRaw"), dict) else {}
+        provider_raw_cached_tokens = _to_int(
+            (provider_raw.get("input_tokens_details") or {}).get("cached_tokens"),
+            _to_int((provider_raw.get("prompt_tokens_details") or {}).get("cached_tokens"), 0),
+        )
+        cached_tokens = _to_int(
+            usage.get("cachedTokens"),
+            _to_int(
+                usage.get("cached_tokens"),
+                _to_int(
+                    (usage.get("input_tokens_details") or {}).get("cached_tokens"),
+                    _to_int((usage.get("prompt_tokens_details") or {}).get("cached_tokens"), provider_raw_cached_tokens),
+                ),
+            ),
+        )
         cost_obj = usage.get("cost", {}) if isinstance(usage.get("cost"), dict) else {}
         context_detail = _build_call_context_detail(transcript, idx)
         calls.append({
@@ -595,7 +617,10 @@ def _extract_llm_calls_from_transcript(transcript: List[Dict[str, Any]]) -> List
             "stop_reason": msg.get("stopReason"),
             "input_tokens": _to_int(usage.get("input"), _to_int(usage.get("input_tokens"), _to_int(usage.get("prompt_tokens"), 0))),
             "output_tokens": _to_int(usage.get("output"), _to_int(usage.get("output_tokens"), _to_int(usage.get("completion_tokens"), 0))),
-            "cache_read_tokens": _to_int(usage.get("cacheRead"), _to_int(usage.get("cache_read_tokens"), _to_int(usage.get("cache_read_input_tokens"), 0))),
+            "cache_read_tokens": _to_int(
+                usage.get("cacheRead"),
+                _to_int(usage.get("cache_read_tokens"), _to_int(usage.get("cache_read_input_tokens"), cached_tokens)),
+            ),
             "cache_write_tokens": _to_int(usage.get("cacheWrite"), _to_int(usage.get("cache_write_tokens"), _to_int(usage.get("cache_creation_input_tokens"), 0))),
             "total_tokens": _to_int(usage.get("totalTokens"), _to_int(usage.get("total_tokens"), 0)),
             "cost_usd": _to_float(cost_obj.get("total"), _to_float(usage.get("cost_usd"), 0.0)),
