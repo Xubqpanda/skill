@@ -11,8 +11,11 @@ import os
 import re
 import subprocess
 import time
+from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional, Tuple
+from urllib import error as urllib_error
+from urllib import request as urllib_request
 
 from lib_tasks import Task
 
@@ -21,6 +24,24 @@ logger = logging.getLogger(__name__)
 MAX_OPENCLAW_MESSAGE_CHARS = int(os.environ.get("PINCHBENCH_MAX_MSG_CHARS", "4000"))
 CONTEXT_HASH_PREFIX_CHARS = int(os.environ.get("PINCHBENCH_CONTEXT_HASH_PREFIX_CHARS", "1024"))
 CONTEXT_RECENT_MESSAGES = int(os.environ.get("PINCHBENCH_CONTEXT_RECENT_MESSAGES", "4"))
+PINCHBENCH_PROVIDER_TAP_PATH = Path(
+    os.environ.get(
+        "PINCHBENCH_PROVIDER_TAP_PATH",
+        str(Path.home() / ".openclaw" / "ecoclaw-plugin-state" / "ecoclaw" / "provider-traffic.jsonl"),
+    )
+)
+PINCHBENCH_LLM_HOOK_TAP_PATH = Path(
+    os.environ.get(
+        "PINCHBENCH_LLM_HOOK_TAP_PATH",
+        str(PINCHBENCH_PROVIDER_TAP_PATH).replace(".jsonl", ".llm-hooks.jsonl"),
+    )
+)
+PINCHBENCH_RECONCILE_PROVIDER_USAGE = (
+    os.environ.get("PINCHBENCH_RECONCILE_PROVIDER_USAGE", "1").strip().lower() not in {"0", "false", "off", "no"}
+)
+PINCHBENCH_RECONCILE_TIMEOUT_SECONDS = float(
+    os.environ.get("PINCHBENCH_RECONCILE_TIMEOUT_SECONDS", "60")
+)
 
 
 def slugify_model(model_id: str) -> str:
@@ -118,6 +139,345 @@ def _build_call_context_detail(
         "prefix_signature_normalized_sha256": _sha256_text(normalized_payload[:prefix_chars]),
         "recent_messages": recent_messages,
     }
+
+
+def _to_int(value: Any, default: int = 0) -> int:
+    try:
+        if value is None:
+            return default
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _to_float(value: Any, default: float = 0.0) -> float:
+    try:
+        if value is None:
+            return default
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _parse_iso_ts(value: Any) -> Optional[float]:
+    if not value:
+        return None
+    try:
+        text = str(value).strip()
+        if text.endswith("Z"):
+            text = text[:-1] + "+00:00"
+        return datetime.fromisoformat(text).timestamp()
+    except (TypeError, ValueError):
+        return None
+
+
+def _read_jsonl_records(path: Path) -> List[Dict[str, Any]]:
+    if not path.exists():
+        return []
+    records: List[Dict[str, Any]] = []
+    for line in path.read_text(encoding="utf-8").splitlines():
+        if not line.strip():
+            continue
+        try:
+            parsed = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(parsed, dict):
+            records.append(parsed)
+    return records
+
+
+def _normalize_prompt_for_match(prompt: str) -> str:
+    text = _ensure_text(prompt)
+    text = re.sub(r"^\[[^\]]+\]\s*", "", text).strip()
+    return text
+
+
+def _extract_request_body_prompt_text(request_body: str) -> str:
+    try:
+        payload = json.loads(request_body)
+    except json.JSONDecodeError:
+        return ""
+    input_items = payload.get("input")
+    if not isinstance(input_items, list):
+        return ""
+    user_texts: List[str] = []
+    for item in input_items:
+        if not isinstance(item, dict):
+            continue
+        if str(item.get("role") or "") != "user":
+            continue
+        user_texts.append(_message_content_to_text(item.get("content")))
+    return "\n".join([text for text in user_texts if text]).strip()
+
+
+def _is_strict_first_turn_request(request_body: str) -> bool:
+    try:
+        payload = json.loads(request_body)
+    except json.JSONDecodeError:
+        return False
+    input_items = payload.get("input")
+    if not isinstance(input_items, list) or len(input_items) != 2:
+        return False
+    first = input_items[0] if isinstance(input_items[0], dict) else {}
+    second = input_items[1] if isinstance(input_items[1], dict) else {}
+    return str(first.get("role") or "") == "developer" and str(second.get("role") or "") == "user"
+
+
+def _load_provider_configs() -> List[Dict[str, Any]]:
+    cfg_path = Path.home() / ".openclaw" / "openclaw.json"
+    try:
+        parsed = json.loads(cfg_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return []
+    providers = parsed.get("models", {}).get("providers", {})
+    if not isinstance(providers, dict):
+        return []
+    out: List[Dict[str, Any]] = []
+    for provider_id, provider_cfg in providers.items():
+        if not isinstance(provider_cfg, dict):
+            continue
+        base_url = str(provider_cfg.get("baseUrl") or "").rstrip("/")
+        api_key = str(provider_cfg.get("apiKey") or "")
+        if not base_url or not api_key:
+            continue
+        out.append(
+            {
+                "id": str(provider_id),
+                "base_url": base_url,
+                "api_key": api_key,
+                "auth_header": bool(provider_cfg.get("authHeader", True)),
+            }
+        )
+    return out
+
+
+def _find_provider_config_for_url(url: str) -> Optional[Dict[str, Any]]:
+    url = str(url or "")
+    best: Optional[Dict[str, Any]] = None
+    for provider_cfg in _load_provider_configs():
+        base_url = str(provider_cfg.get("base_url") or "")
+        if not base_url:
+            continue
+        if url == base_url or url.startswith(base_url + "/"):
+            if best is None or len(base_url) > len(str(best.get("base_url") or "")):
+                best = provider_cfg
+    return best
+
+
+def _replay_request_for_usage(url: str, request_body: str) -> Optional[Dict[str, int]]:
+    provider_cfg = _find_provider_config_for_url(url)
+    if provider_cfg is None:
+        return None
+    try:
+        payload = json.loads(request_body)
+    except json.JSONDecodeError:
+        return None
+    payload["stream"] = False
+    payload["max_output_tokens"] = 1
+    data = json.dumps(payload).encode("utf-8")
+    headers = {"content-type": "application/json"}
+    if provider_cfg.get("auth_header", True):
+        headers["authorization"] = f"Bearer {provider_cfg['api_key']}"
+    req = urllib_request.Request(url, data=data, headers=headers, method="POST")
+    try:
+        with urllib_request.urlopen(req, timeout=PINCHBENCH_RECONCILE_TIMEOUT_SECONDS) as resp:
+            raw = resp.read().decode("utf-8", errors="replace")
+    except (urllib_error.HTTPError, urllib_error.URLError, TimeoutError, OSError) as exc:
+        logger.debug("Provider usage replay failed for %s: %s", url, exc)
+        return None
+    try:
+        parsed = json.loads(raw)
+    except json.JSONDecodeError:
+        return None
+    usage = parsed.get("usage", {})
+    if not isinstance(usage, dict):
+        usage = parsed.get("response", {}).get("usage", {})
+    if not isinstance(usage, dict):
+        return None
+    raw_input_tokens = _to_int(usage.get("input_tokens"), _to_int(usage.get("prompt_tokens"), 0))
+    raw_cached_tokens = _to_int(
+        (usage.get("input_tokens_details") or {}).get("cached_tokens"),
+        _to_int((usage.get("prompt_tokens_details") or {}).get("cached_tokens"), 0),
+    )
+    return {
+        "raw_input_tokens": raw_input_tokens,
+        "cached_tokens": raw_cached_tokens,
+    }
+
+
+def _read_provider_tap_response_pairs() -> List[Dict[str, Any]]:
+    records = _read_jsonl_records(PINCHBENCH_PROVIDER_TAP_PATH)
+    pairs: List[Dict[str, Any]] = []
+    for rec in records:
+        if str(rec.get("method") or "").upper() != "POST":
+            continue
+        url = str(rec.get("url") or "")
+        if not url.endswith("/responses"):
+            continue
+        request_body = rec.get("requestBody")
+        if not isinstance(request_body, str) or not request_body.strip():
+            continue
+        pairs.append(
+            {
+                "at": rec.get("at"),
+                "at_ts": _parse_iso_ts(rec.get("at")),
+                "url": url,
+                "request_body": request_body,
+                "request_prompt_text": _normalize_prompt_for_match(_extract_request_body_prompt_text(request_body)),
+                "is_first_turn": _is_strict_first_turn_request(request_body),
+            }
+        )
+    return pairs
+
+
+def _read_llm_input_events_for_session(session_id: str) -> List[Dict[str, Any]]:
+    events = _read_jsonl_records(PINCHBENCH_LLM_HOOK_TAP_PATH)
+    out: List[Dict[str, Any]] = []
+    for rec in events:
+        if rec.get("hook") != "llm_input":
+            continue
+        event = rec.get("event")
+        if not isinstance(event, dict):
+            continue
+        if str(event.get("sessionId") or "") != session_id:
+            continue
+        out.append(
+            {
+                "at": rec.get("at"),
+                "at_ts": _parse_iso_ts(rec.get("at")),
+                "prompt": str(event.get("prompt") or ""),
+                "provider": str(event.get("provider") or ""),
+                "model": str(event.get("model") or ""),
+            }
+        )
+    return out
+
+
+def _match_provider_requests_to_session_calls(session_id: str) -> List[Optional[Dict[str, Any]]]:
+    llm_inputs = _read_llm_input_events_for_session(session_id)
+    if not llm_inputs:
+        return []
+    request_pairs = _read_provider_tap_response_pairs()
+    used_indices: set[int] = set()
+    matched: List[Optional[Dict[str, Any]]] = []
+    for input_event in llm_inputs:
+        prompt_match = _normalize_prompt_for_match(input_event.get("prompt", ""))
+        prompt_key = prompt_match[:120]
+        llm_at = input_event.get("at_ts")
+        best_idx: Optional[int] = None
+        best_score: Optional[Tuple[int, float]] = None
+        for idx, pair in enumerate(request_pairs):
+            if idx in used_indices:
+                continue
+            pair_at = pair.get("at_ts")
+            if llm_at is not None and pair_at is not None:
+                delta = pair_at - llm_at
+                if delta < -2.0 or delta > 10.0:
+                    continue
+                distance = abs(delta)
+            else:
+                distance = float("inf")
+            prompt_text = str(pair.get("request_prompt_text") or "")
+            prompt_hit = int(bool(prompt_key) and prompt_key in prompt_text)
+            score = (-prompt_hit, distance)
+            if best_score is None or score < best_score:
+                best_score = score
+                best_idx = idx
+        if best_idx is None:
+            matched.append(None)
+            continue
+        used_indices.add(best_idx)
+        matched.append(request_pairs[best_idx])
+    return matched
+
+
+def _summarize_llm_calls(llm_calls: List[Dict[str, Any]]) -> Dict[str, Any]:
+    totals = {
+        "input_tokens": 0,
+        "output_tokens": 0,
+        "cache_read_tokens": 0,
+        "cache_write_tokens": 0,
+        "cache_hit_tokens": 0,
+        "total_tokens": 0,
+        "cost_usd": 0.0,
+        "request_count": len(llm_calls),
+        "usage_available_count": 0,
+        "usage_missing_count": 0,
+    }
+    for call in llm_calls:
+        input_tokens = _to_int(call.get("input_tokens"), 0)
+        output_tokens = _to_int(call.get("output_tokens"), 0)
+        cache_read_tokens = _to_int(call.get("cache_read_tokens"), _to_int(call.get("cached_tokens"), 0))
+        cache_write_tokens = _to_int(
+            call.get("cache_write_tokens"),
+            _to_int(call.get("cache_creation_input_tokens"), 0),
+        )
+        total_tokens = _to_int(
+            call.get("total_tokens"),
+            input_tokens + output_tokens + cache_read_tokens + cache_write_tokens,
+        )
+        totals["input_tokens"] += input_tokens
+        totals["output_tokens"] += output_tokens
+        totals["cache_read_tokens"] += cache_read_tokens
+        totals["cache_write_tokens"] += cache_write_tokens
+        totals["cache_hit_tokens"] += cache_read_tokens
+        totals["total_tokens"] += total_tokens
+        totals["cost_usd"] += _to_float(call.get("cost_usd"), 0.0)
+        if input_tokens > 0 or output_tokens > 0 or total_tokens > 0:
+            totals["usage_available_count"] += 1
+        else:
+            totals["usage_missing_count"] += 1
+    return totals
+
+
+def _reconcile_llm_calls_with_provider_tap(
+    llm_calls: List[Dict[str, Any]],
+    *,
+    transcript_session_id: Optional[str],
+) -> List[Dict[str, Any]]:
+    if not PINCHBENCH_RECONCILE_PROVIDER_USAGE:
+        return llm_calls
+    if not transcript_session_id:
+        return llm_calls
+    if not PINCHBENCH_PROVIDER_TAP_PATH.exists() or not PINCHBENCH_LLM_HOOK_TAP_PATH.exists():
+        return llm_calls
+    matched_requests = _match_provider_requests_to_session_calls(transcript_session_id)
+    if not matched_requests:
+        return llm_calls
+    reconciled_calls: List[Dict[str, Any]] = []
+    for idx, call in enumerate(llm_calls):
+        next_call = dict(call)
+        next_call.setdefault("usage_source", "transcript")
+        request_match = matched_requests[idx] if idx < len(matched_requests) else None
+        if (
+            request_match
+            and str(next_call.get("api") or "") == "openai-responses"
+            and _to_int(next_call.get("cache_read_tokens"), 0) == 0
+            and bool(request_match.get("is_first_turn"))
+        ):
+            replay_usage = _replay_request_for_usage(
+                str(request_match.get("url") or ""),
+                str(request_match.get("request_body") or ""),
+            )
+            if replay_usage and replay_usage.get("cached_tokens", 0) > 0:
+                raw_input_tokens = _to_int(replay_usage.get("raw_input_tokens"), 0)
+                cached_tokens = _to_int(replay_usage.get("cached_tokens"), 0)
+                uncached_input_tokens = max(0, raw_input_tokens - cached_tokens)
+                output_tokens = _to_int(next_call.get("output_tokens"), 0)
+                cache_write_tokens = _to_int(next_call.get("cache_write_tokens"), 0)
+                next_call["input_tokens_raw"] = raw_input_tokens
+                next_call["cached_tokens_raw"] = cached_tokens
+                next_call["input_tokens"] = uncached_input_tokens
+                next_call["cache_read_tokens"] = cached_tokens
+                next_call["total_tokens"] = (
+                    uncached_input_tokens + output_tokens + cached_tokens + cache_write_tokens
+                )
+                next_call["usage_source"] = "provider_tap_replay"
+                next_call["usage_reconciled"] = True
+                next_call["provider_request_at"] = request_match.get("at")
+        reconciled_calls.append(next_call)
+    return reconciled_calls
 
 
 
@@ -427,9 +787,25 @@ def _wait_for_transcript_appearance(
     return None
 
 
-def _load_transcript(agent_id: str, session_id: str, started_at: float) -> List[Dict[str, Any]]:
+def _read_transcript_file(transcript_path: Path) -> List[Dict[str, Any]]:
+    _wait_for_transcript_unlock(transcript_path)
+
+    transcript: List[Dict[str, Any]] = []
+    for line in transcript_path.read_text(encoding="utf-8").splitlines():
+        if not line.strip():
+            continue
+        try:
+            transcript.append(json.loads(line))
+        except json.JSONDecodeError as exc:
+            logger.warning("Failed to parse transcript line: %s", exc)
+            transcript.append({"raw": line, "parse_error": str(exc)})
+    return transcript
+
+
+def _load_transcript_bundle(agent_id: str, session_id: str, started_at: float) -> Dict[str, Any]:
     agent_dir = _get_agent_store_dir(agent_id)
     transcript_path = None
+    resolved_session_id: Optional[str] = None
 
     # OpenClaw ignores the --session-id we pass and generates its own UUID-based
     # session ID internally.  We need to discover the actual transcript path.
@@ -444,9 +820,10 @@ def _load_transcript(agent_id: str, session_id: str, started_at: float) -> List[
     max_attempts = 10
     for attempt in range(max_attempts):
         # 1. Try sessions.json first — OpenClaw writes the real UUID here
-        resolved_session_id = _resolve_session_id_from_store(agent_id)
-        if resolved_session_id:
-            candidate = agent_dir / "sessions" / f"{resolved_session_id}.jsonl"
+        candidate_session_id = _resolve_session_id_from_store(agent_id)
+        if candidate_session_id:
+            resolved_session_id = candidate_session_id
+            candidate = agent_dir / "sessions" / f"{candidate_session_id}.jsonl"
             if candidate.exists():
                 transcript_path = candidate
                 logger.info(
@@ -500,6 +877,7 @@ def _load_transcript(agent_id: str, session_id: str, started_at: float) -> List[
                 )
                 if waited_path is not None:
                     transcript_path = waited_path
+                    resolved_session_id = waited_path.stem
                     logger.info("Found transcript after lock wait: %s", waited_path.name)
             all_files = list(sessions_dir.iterdir())
         if transcript_path is None and sessions_dir.exists():
@@ -513,20 +891,22 @@ def _load_transcript(agent_id: str, session_id: str, started_at: float) -> List[
                 "Transcript not found — sessions dir does not exist: %s",
                 sessions_dir,
             )
-        return []
+        return {
+            "transcript": [],
+            "transcript_path": None,
+            "transcript_session_id": resolved_session_id,
+        }
 
-    _wait_for_transcript_unlock(transcript_path)
+    return {
+        "transcript": _read_transcript_file(transcript_path),
+        "transcript_path": str(transcript_path),
+        "transcript_session_id": transcript_path.stem or resolved_session_id or session_id,
+    }
 
-    transcript: List[Dict[str, Any]] = []
-    for line in transcript_path.read_text(encoding="utf-8").splitlines():
-        if not line.strip():
-            continue
-        try:
-            transcript.append(json.loads(line))
-        except json.JSONDecodeError as exc:
-            logger.warning("Failed to parse transcript line: %s", exc)
-            transcript.append({"raw": line, "parse_error": str(exc)})
-    return transcript
+
+def _load_transcript(agent_id: str, session_id: str, started_at: float) -> List[Dict[str, Any]]:
+    bundle = _load_transcript_bundle(agent_id, session_id, started_at)
+    return bundle.get("transcript", [])
 
 
 def _extract_usage_from_transcript(transcript: List[Dict[str, Any]]) -> Dict[str, Any]:
@@ -770,7 +1150,8 @@ def execute_openclaw_task(
 
     stdout, stderr, exit_code, timed_out = _run_once(session_id, timeout_seconds)
 
-    transcript = _load_transcript(agent_id, session_id, start_time)
+    transcript_bundle = _load_transcript_bundle(agent_id, session_id, start_time)
+    transcript = transcript_bundle.get("transcript", [])
 
     # Parallel runs occasionally race with transcript persistence. Retry once
     # to reduce false negatives when execution succeeded but transcript is empty.
@@ -794,10 +1175,22 @@ def execute_openclaw_task(
         stderr = f"{stderr}\n{retry_stderr}".strip() if stderr else retry_stderr
         exit_code = retry_exit_code
         timed_out = retry_timed_out
-        transcript = _load_transcript(agent_id, retry_session_id, retry_started_at)
+        transcript_bundle = _load_transcript_bundle(agent_id, retry_session_id, retry_started_at)
+        transcript = transcript_bundle.get("transcript", [])
 
-    usage = _extract_usage_from_transcript(transcript)
     llm_calls = _extract_llm_calls_from_transcript(transcript)
+    transcript_session_id = transcript_bundle.get("transcript_session_id")
+    llm_calls = _reconcile_llm_calls_with_provider_tap(
+        llm_calls,
+        transcript_session_id=str(transcript_session_id) if transcript_session_id else None,
+    )
+    usage = _summarize_llm_calls(llm_calls) if llm_calls else _extract_usage_from_transcript(transcript)
+    usage["usage_source"] = (
+        "llm_calls_reconciled"
+        if any(bool(call.get("usage_reconciled")) for call in llm_calls)
+        else ("llm_calls" if llm_calls else "transcript")
+    )
+    usage["usage_reconciled_count"] = sum(1 for call in llm_calls if call.get("usage_reconciled"))
     execution_time = time.time() - start_time
 
     status = "success"
@@ -851,6 +1244,8 @@ def execute_openclaw_task(
         "task_id": task.task_id,
         "status": status,
         "transcript": transcript,
+        "transcript_session_id": transcript_session_id,
+        "transcript_path": transcript_bundle.get("transcript_path"),
         "llm_calls": llm_calls,
         "llm_models": sorted({str(call.get("model")) for call in llm_calls if call.get("model")}),
         "usage": usage,
