@@ -7,6 +7,8 @@ from __future__ import annotations
 import json
 import logging
 import os
+import platform
+import stat
 import subprocess
 import time
 from pathlib import Path
@@ -18,6 +20,8 @@ from lib_tasks import Task
 
 logger = logging.getLogger(__name__)
 
+USE_SHELL = platform.system() == "Windows"
+
 
 class ModelValidationError(Exception):
     """Raised when a model ID is invalid or inaccessible."""
@@ -25,7 +29,8 @@ class ModelValidationError(Exception):
     pass
 
 
-MAX_OPENCLAW_MESSAGE_CHARS = int(os.environ.get("PINCHBENCH_MAX_MSG_CHARS", "4000"))
+MAX_OPENCLAW_MESSAGE_CHARS = int(os.environ.get("PINCHBENCH_MAX_MSG_CHARS", "8000"))
+JUDGE_MAX_MSG_CHARS = int(os.environ.get("PINCHBENCH_JUDGE_MAX_MSG_CHARS", "3000"))
 
 
 def _coerce_subprocess_output(value: Any) -> str:
@@ -163,6 +168,7 @@ def _get_agent_workspace(agent_id: str) -> Path | None:
             capture_output=True,
             text=True,
             check=False,
+            shell=USE_SHELL,
         )
         if list_result.returncode != 0:
             return None
@@ -206,6 +212,7 @@ def ensure_agent_exists(agent_id: str, model_id: str, workspace_dir: Path) -> bo
             capture_output=True,
             text=True,
             check=False,
+            shell=USE_SHELL,
         )
     except FileNotFoundError:
         logger.error("openclaw CLI not found while listing agents")
@@ -248,6 +255,7 @@ def ensure_agent_exists(agent_id: str, model_id: str, workspace_dir: Path) -> bo
                 capture_output=True,
                 text=True,
                 check=False,
+            shell=USE_SHELL,
             )
 
     logger.info("Creating OpenClaw agent %s", agent_id)
@@ -267,6 +275,7 @@ def ensure_agent_exists(agent_id: str, model_id: str, workspace_dir: Path) -> bo
             capture_output=True,
             text=True,
             check=False,
+            shell=USE_SHELL,
         )
     except FileNotFoundError:
         logger.error("openclaw CLI not found while creating agent")
@@ -276,6 +285,44 @@ def ensure_agent_exists(agent_id: str, model_id: str, workspace_dir: Path) -> bo
         logger.warning(
             "Agent creation returned %s: %s", create_result.returncode, create_result.stderr
         )
+
+    # Copy main agent's models.json to bench agent so custom providers (e.g. lenovo)
+    # are available. OpenClaw only copies a subset of providers when creating a new agent.
+    main_models = Path.home() / ".openclaw" / "agents" / "main" / "agent" / "models.json"
+    if main_models.exists():
+        bench_agent_dir = _get_agent_store_dir(agent_id) / "agent"
+        bench_agent_dir.mkdir(parents=True, exist_ok=True)
+        bench_models = bench_agent_dir / "models.json"
+        import shutil as _shutil
+        _shutil.copy2(main_models, bench_models)
+        # Set defaultProvider/defaultModel so OpenClaw uses the requested model
+        if "/" in model_id:
+            provider_name, model_name = model_id.split("/", 1)
+            try:
+                import json as _json
+                raw = bench_models.read_text("utf-8-sig")
+                data = _json.loads(raw)
+                data["defaultProvider"] = provider_name
+                data["defaultModel"] = model_name
+                bench_models.write_text(_json.dumps(data, indent=2, ensure_ascii=False), "utf-8")
+                logger.info(
+                    "Set bench agent default model to %s / %s", provider_name, model_name
+                )
+            except Exception as exc:
+                logger.warning("Failed to set default model in bench models.json: %s", exc)
+        logger.info("Copied main agent models.json to bench agent %s", agent_id)
+
+        # Delete sessions.json so OpenClaw picks up the new defaultProvider/defaultModel
+        # instead of reusing a cached session entry that still points to an old model.
+        bench_sessions_dir = _get_agent_store_dir(agent_id) / "sessions"
+        sessions_store = bench_sessions_dir / "sessions.json"
+        if sessions_store.exists():
+            try:
+                sessions_store.unlink()
+                logger.info("Deleted stale sessions.json for bench agent %s", agent_id)
+            except OSError as exc:
+                logger.warning("Failed to delete sessions.json: %s", exc)
+
     return True
 
 
@@ -317,11 +364,28 @@ def prepare_task_workspace(skill_dir: Path, run_id: str, task: Task, agent_id: s
         logger.warning("Could not find agent workspace, using fallback")
         workspace = Path(f"/tmp/pinchbench/{run_id}/{task.task_id}")
 
-    # Clear workspace before each task to prevent stale files from prior tasks
-    # from contaminating the agent's context.
+    _BOOTSTRAP_FILES = ["SOUL.md", "BOOTSTRAP.md", "USER.md", "IDENTITY.md", "HEARTBEAT.md", "TOOLS.md"]
+
+    def _remove_readonly(func, path, _):
+    def _remove_readonly(func, path, _):
+        try:
+            os.chmod(path, stat.S_IWRITE)
+            func(path)
+        except OSError:
+            pass
+        func(path)
+
+    saved_bootstrap: dict[str, bytes] = {}
     if workspace.exists():
-        shutil.rmtree(workspace)
+        for fname in _BOOTSTRAP_FILES:
+            fpath = workspace / fname
+            if fpath.exists():
+                saved_bootstrap[fname] = fpath.read_bytes()
+        shutil.rmtree(workspace, onerror=_remove_readonly)
     workspace.mkdir(parents=True, exist_ok=True)
+
+    for fname, content in saved_bootstrap.items():
+        (workspace / fname).write_bytes(content)
 
     for file_spec in task.workspace_files:
         if "content" in file_spec:
@@ -339,17 +403,6 @@ def prepare_task_workspace(skill_dir: Path, run_id: str, task: Task, agent_id: s
             logger.error("Workspace file not found: %s", source)
             raise
 
-    # Remove bootstrap files that would trigger the onboarding flow
-    # These interfere with benchmark tasks
-    for bootstrap_file in ["BOOTSTRAP.md", "SOUL.md", "USER.md", "IDENTITY.md"]:
-        bootstrap_path = workspace / bootstrap_file
-        if bootstrap_path.exists():
-            try:
-                bootstrap_path.unlink()
-                logger.info("Removed bootstrap file: %s", bootstrap_file)
-            except OSError as exc:
-                logger.warning("Failed to remove %s: %s", bootstrap_file, exc)
-
     # Copy skills from main workspace to benchmark workspace
     # This enables benchmark agents to use installed skills like nano-pdf
     main_skills_dir = Path.home() / ".openclaw" / "workspace" / "skills"
@@ -363,7 +416,7 @@ def prepare_task_workspace(skill_dir: Path, run_id: str, task: Task, agent_id: s
                 import shutil
 
                 if dest_skill_dir.exists():
-                    shutil.rmtree(dest_skill_dir)
+                    shutil.rmtree(dest_skill_dir, onerror=_remove_readonly)
                 shutil.copytree(skill_dir_src, dest_skill_dir)
                 logger.info("Copied skill to benchmark workspace: %s", skill_dir_src.name)
 
@@ -684,6 +737,7 @@ def execute_openclaw_task(
                     cwd=str(workspace),
                     timeout=remaining,
                     check=False,
+            shell=USE_SHELL,
                 )
                 stdout += result.stdout
                 stderr += result.stderr
@@ -717,6 +771,7 @@ def execute_openclaw_task(
                 cwd=str(workspace),
                 timeout=timeout_seconds,
                 check=False,
+            shell=USE_SHELL,
             )
             stdout = result.stdout
             stderr = result.stderr
@@ -801,9 +856,18 @@ def run_openclaw_prompt(
     timeout_seconds: float,
 ) -> Dict[str, Any]:
     """Run a single OpenClaw prompt for helper agents like the judge."""
-    # Clean up previous session transcripts so we can reliably find this
-    # prompt's transcript (OpenClaw uses its own UUID-based naming).
     cleanup_agent_sessions(agent_id)
+
+    agent_workspace = _get_agent_workspace(agent_id)
+    if agent_workspace and agent_workspace.exists():
+        for bootstrap_file in ["BOOTSTRAP.md", "SOUL.md", "USER.md", "IDENTITY.md", "HEARTBEAT.md"]:
+            bp = agent_workspace / bootstrap_file
+            if bp.exists():
+                try:
+                    bp.unlink()
+                    logger.debug("Removed bootstrap file from judge workspace: %s", bootstrap_file)
+                except OSError as exc:
+                    logger.warning("Failed to remove bootstrap file %s: %s", bootstrap_file, exc)
 
     start_time = time.time()
     workspace.mkdir(parents=True, exist_ok=True)
@@ -814,8 +878,8 @@ def run_openclaw_prompt(
     timed_out = False
 
     chunks = [
-        prompt[i : i + MAX_OPENCLAW_MESSAGE_CHARS]
-        for i in range(0, max(1, len(prompt)), MAX_OPENCLAW_MESSAGE_CHARS)
+        prompt[i : i + JUDGE_MAX_MSG_CHARS]
+        for i in range(0, max(1, len(prompt)), JUDGE_MAX_MSG_CHARS)
     ]
     if len(chunks) > 1:
         total_chunks = len(chunks)
@@ -843,22 +907,32 @@ def run_openclaw_prompt(
             timed_out = True
             break
         try:
+            openclaw_path = os.environ.get("OPENCLAW_PATH", "openclaw")
+            # On Windows, cmd.exe splits command-line arguments at literal newlines,
+            # causing the message to be truncated after the first line.
+            # Escape newlines to literal \n sequences so the full prompt is received.
+            send_chunk = (
+                chunk.replace("\r\n", "\\n").replace("\n", "\\n").replace("\r", "\\n")
+                if USE_SHELL
+                else chunk
+            )
             result = subprocess.run(
                 [
-                    "openclaw",
+                    openclaw_path,
                     "agent",
                     "--agent",
                     agent_id,
                     "--session-id",
                     session_id,
                     "--message",
-                    chunk,
+                    send_chunk,
                 ],
                 capture_output=True,
                 text=True,
                 cwd=str(workspace),
                 timeout=remaining,
                 check=False,
+                shell=USE_SHELL,
             )
             stdout += result.stdout
             stderr += result.stderr

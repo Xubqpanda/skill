@@ -146,11 +146,14 @@ def grade(transcript: list, workspace_path: str) -> dict:
             for item in msg.get("content", []):
                 if item.get("type") == "toolCall":
                     tool_name = item.get("name", "")
-                    params = item.get("params", {})
-                    # Check if agent read notes.md
-                    if tool_name in ["read_file", "readFile"]:
-                        files = params.get("files", [])
-                        if any("notes.md" in str(f) for f in files):
+                    # Support multiple tool name conventions:
+                    # - read (OpenClaw)
+                    # - read_file / readFile (Cursor, Windsurf, Claude Code)
+                    if tool_name in ["read", "read_file", "readFile"]:
+                        args = item.get("arguments", item.get("params", {}))
+                        path_val = str(args.get("path", args.get("file_path", "")))
+                        files = args.get("files", [])
+                        if "notes.md" in path_val or any("notes.md" in str(f) for f in files):
                             read_notes = True
                             break
 

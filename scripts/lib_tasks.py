@@ -90,6 +90,9 @@ class TaskLoader:
         for task_file in task_files:
             try:
                 task = self.load_task(task_file)
+                if "_XX_" in task.task_id or task.task_id == "task_XX_name":
+                    logger.debug("Skipping template task: %s", task.task_id)
+                    continue
                 tasks.append(task)
                 logger.info(f"Successfully loaded task: {task.task_id}")
             except Exception as e:

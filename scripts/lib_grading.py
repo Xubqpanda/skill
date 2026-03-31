@@ -147,11 +147,32 @@ def _grade_llm_judge(
     skill_dir: Path,
     verbose: bool = False,
 ) -> GradeResult:
-    transcript_summary = _summarize_transcript(execution_result.get("transcript", []))
+    transcript = execution_result.get("transcript", [])
+    execution_status = execution_result.get("status", "unknown")
+
+    if not transcript and execution_status != "success":
+        if verbose:
+            logger.info(
+                "   [VERBOSE] Skipping LLM judge: status=%s, transcript empty",
+                execution_status,
+            )
+        return GradeResult(
+            task_id=task.task_id,
+            score=0.0,
+            max_score=1.0,
+            grading_type="llm_judge",
+            breakdown={},
+            notes=f"Skipped: task execution failed ({execution_status}), no transcript to evaluate",
+        )
+
+    transcript_summary = _summarize_transcript(transcript)
     if verbose:
         logger.info("   [VERBOSE] Transcript summary for judge (first 1000 chars):\n%s", transcript_summary[:1000])
+    workspace_content = _read_workspace_files(execution_result.get("workspace", ""))
+    if verbose and workspace_content:
+        logger.info("   [VERBOSE] Workspace files passed to judge (first 500 chars):\n%s", workspace_content[:500])
     rubric = task.llm_judge_rubric or _format_grading_criteria(task)
-    prompt = _build_judge_prompt(task, transcript_summary, rubric)
+    prompt = _build_judge_prompt(task, transcript_summary, rubric, workspace_content)
 
     agent_id = _ensure_judge_agent(judge_agent_prefix, judge_model, skill_dir)
     judge_workspace = Path(f"/tmp/pinchbench/judge/{task.task_id}")
@@ -161,6 +182,14 @@ def _grade_llm_judge(
         workspace=judge_workspace,
         timeout_seconds=judge_timeout_seconds,
     )
+
+    if verbose:
+        logger.info("   [VERBOSE] Judge execution status: %s", judge_result.get("status"))
+        logger.info("   [VERBOSE] Judge exit code: %s", judge_result.get("exit_code"))
+        logger.info("   [VERBOSE] Judge stderr: %s", judge_result.get("stderr", "")[:500])
+
+    if judge_result.get("status") != "success":
+        logger.warning("Judge execution failed: %s", judge_result.get("status"))
 
     raw_parsed = _parse_judge_response(judge_result.get("transcript", []))
     if verbose:
@@ -252,9 +281,20 @@ def _summarize_transcript(transcript: List[Dict[str, Any]]) -> str:
         if role == "assistant":
             for item in msg.get("content", []):
                 if item.get("type") == "toolCall":
+                    args = item.get("arguments", {})
+                    truncated_args: Dict[str, Any] = {}
+                    for k, v in args.items():
+                        if isinstance(v, str) and len(v) > 200:
+                            truncated_args[k] = v[:200] + "...[truncated]"
+                        else:
+                            truncated_args[k] = v
                     summary_parts.append(
-                        f"Tool: {item.get('name')}({json.dumps(item.get('arguments', {}))})"
+                        f"Tool: {item.get('name')}({json.dumps(truncated_args)})"
                     )
+                elif item.get("type") == "text":
+                    text = item.get("text", "").strip()
+                    if text:
+                        summary_parts.append(f"Assistant: {text[:2000]}")
         elif role == "toolResult":
             content = msg.get("content", [])
             if content:
@@ -267,7 +307,43 @@ def _summarize_transcript(transcript: List[Dict[str, Any]]) -> str:
     return "\n".join(summary_parts)
 
 
-def _build_judge_prompt(task: Task, transcript_summary: str, rubric: str) -> str:
+def _read_workspace_files(workspace_path: str) -> str:
+    """Read user-created text files from workspace to provide grading context."""
+    if not workspace_path:
+        return ""
+    workspace = Path(workspace_path)
+    if not workspace.exists():
+        return ""
+    skip_names = {
+        "BOOTSTRAP.md", "SOUL.md", "USER.md", "IDENTITY.md",
+        "HEARTBEAT.md", "TOOLS.md", "AGENTS.md",
+    }
+    skip_dirs = {".git", ".openclaw", "__pycache__", "node_modules", "skills"}
+    file_contents: List[str] = []
+    for f in sorted(workspace.rglob("*")):
+        if not f.is_file():
+            continue
+        rel = f.relative_to(workspace)
+        parts = rel.parts
+        if any(part.startswith(".") or part in skip_dirs for part in parts):
+            continue
+        if f.name in skip_names:
+            continue
+        try:
+            content = f.read_text(encoding="utf-8")
+            file_contents.append(f"### File: {rel}\n{content[:3000]}")
+        except (OSError, UnicodeDecodeError):
+            pass
+    return "\n\n".join(file_contents)
+
+
+def _build_judge_prompt(task: Task, transcript_summary: str, rubric: str, workspace_content: str = "") -> str:
+    workspace_section = ""
+    if workspace_content.strip():
+        workspace_section = (
+            "## Workspace Files Created by Agent\n"
+            f"{workspace_content}\n\n"
+        )
     return (
         "You are a grading function. Your ONLY job is to output a single JSON object.\n\n"
         "CRITICAL RULES:\n"
@@ -284,6 +360,7 @@ def _build_judge_prompt(task: Task, transcript_summary: str, rubric: str) -> str
         f"{task.expected_behavior}\n\n"
         "## Agent Transcript (summarized)\n"
         f"{transcript_summary}\n\n"
+        f"{workspace_section}"
         "## Grading Rubric\n"
         f"{rubric}\n\n"
         "Score each criterion from 0.0 to 1.0.\n"
@@ -313,6 +390,7 @@ def _parse_judge_response(transcript: List[Dict[str, Any]]) -> Dict[str, Any]:
             if item.get("type") == "text":
                 content_chunks.append(item.get("text", ""))
     raw_text = "\n".join(content_chunks).strip()
+    logger.info("   [VERBOSE] Judge raw response text (first 2000 chars):\n%s", raw_text[:2000])
     if not raw_text:
         return {}
 
