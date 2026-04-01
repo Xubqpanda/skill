@@ -526,7 +526,9 @@ def _find_recent_session_path(agent_dir: Path, started_at: float) -> Path | None
     return max(pool, key=lambda path: path.stat().st_mtime)
 
 
-def _load_transcript(agent_id: str, session_id: str, started_at: float) -> List[Dict[str, Any]]:
+def _load_transcript(
+    agent_id: str, session_id: str, started_at: float
+) -> tuple[List[Dict[str, Any]], Optional[Path]]:
     agent_dir = _get_agent_store_dir(agent_id)
     transcript_path = None
 
@@ -621,7 +623,7 @@ def _load_transcript(agent_id: str, session_id: str, started_at: float) -> List[
                 "Transcript not found — sessions dir does not exist: %s",
                 sessions_dir,
             )
-        return []
+        return [], None
 
     transcript: List[Dict[str, Any]] = []
     for line in transcript_path.read_text(encoding="utf-8").splitlines():
@@ -632,7 +634,7 @@ def _load_transcript(agent_id: str, session_id: str, started_at: float) -> List[
         except json.JSONDecodeError as exc:
             logger.warning("Failed to parse transcript line: %s", exc)
             transcript.append({"raw": line, "parse_error": str(exc)})
-    return transcript
+    return transcript, transcript_path
 
 
 def _extract_usage_from_transcript(transcript: List[Dict[str, Any]]) -> Dict[str, Any]:
@@ -674,6 +676,7 @@ def execute_openclaw_task(
     run_id: str,
     timeout_multiplier: float,
     skill_dir: Path,
+    output_dir: Optional[Path] = None,
     verbose: bool = False,
 ) -> Dict[str, Any]:
     logger.info("🤖 Agent [%s] starting task: %s", agent_id, task.task_id)
@@ -781,9 +784,20 @@ def execute_openclaw_task(
         except FileNotFoundError as exc:
             stderr = f"openclaw command not found: {exc}"
 
-    transcript = _load_transcript(agent_id, session_id, start_time)
+    transcript, transcript_path = _load_transcript(agent_id, session_id, start_time)
     usage = _extract_usage_from_transcript(transcript)
     execution_time = time.time() - start_time
+
+    # Archive the raw transcript JSONL before cleanup_agent_sessions deletes it
+    if transcript_path and output_dir:
+        import shutil as _shutil
+        output_dir.mkdir(parents=True, exist_ok=True)
+        archive_dest = output_dir / f"{task.task_id}.jsonl"
+        try:
+            _shutil.copy2(transcript_path, archive_dest)
+            logger.info("Archived transcript to %s", archive_dest)
+        except OSError as exc:
+            logger.warning("Failed to archive transcript: %s", exc)
 
     status = "success"
     if timed_out:
@@ -946,7 +960,7 @@ def run_openclaw_prompt(
             stderr += f"openclaw command not found: {exc}"
             break
 
-    transcript = _load_transcript(agent_id, session_id, start_time)
+    transcript, _ = _load_transcript(agent_id, session_id, start_time)
     execution_time = time.time() - start_time
 
     status = "success"

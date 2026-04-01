@@ -608,6 +608,7 @@ def main():
                     run_id=f"{run_id}-{run_index + 1}",
                     timeout_multiplier=args.timeout_multiplier,
                     skill_dir=skill_dir,
+                    output_dir=Path(args.output_dir) / f"{run_id}_transcripts",
                     verbose=args.verbose,
                 )
             except Exception as exc:

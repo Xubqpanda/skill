@@ -135,6 +135,10 @@ We welcome new tasks! Check out [`tasks/TASK_TEMPLATE.md`](tasks/TASK_TEMPLATE.m
 - **Reproducible** — Same task should produce consistent grading
 - **Challenging** — Tests agent capabilities, not just LLM knowledge
 
+### Transcript Archive
+
+Session transcripts are automatically saved to `results/{run_id}_transcripts/` alongside the results JSON. Each task's full agent conversation is preserved as a JSONL file (e.g. `task_01_calendar.jsonl`) for post-run analysis.
+
 ## Links
 
 - **Leaderboard:** [pinchbench.com](https://pinchbench.com)
