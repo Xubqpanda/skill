@@ -367,13 +367,11 @@ def prepare_task_workspace(skill_dir: Path, run_id: str, task: Task, agent_id: s
     _BOOTSTRAP_FILES = ["SOUL.md", "BOOTSTRAP.md", "USER.md", "IDENTITY.md", "HEARTBEAT.md", "TOOLS.md"]
 
     def _remove_readonly(func, path, _):
-    def _remove_readonly(func, path, _):
         try:
             os.chmod(path, stat.S_IWRITE)
             func(path)
         except OSError:
             pass
-        func(path)
 
     saved_bootstrap: dict[str, bytes] = {}
     if workspace.exists():
