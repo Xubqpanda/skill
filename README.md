@@ -93,7 +93,7 @@ export PINCHBENCH_OFFICIAL_KEY=your_official_key
 | Flag                     | Description                                                                   |
 | ------------------------ | ----------------------------------------------------------------------------- |
 | `--model MODEL`          | Model to test (e.g., `openrouter/anthropic/claude-sonnet-4`)                  |
-| `--judge MODEL`          | Judge model for LLM grading (default: `openrouter/anthropic/claude-opus-4.5`) |
+| `--judge MODEL`          | Judge model for LLM grading; uses direct API when set (see below)                 |
 | `--suite SUITE`          | `all`, `automated-only`, or comma-separated task IDs                          |
 | `--runs N`               | Number of runs per task for averaging                                         |
 | `--timeout-multiplier N` | Scale timeouts for slower models                                              |
@@ -102,6 +102,29 @@ export PINCHBENCH_OFFICIAL_KEY=your_official_key
 | `--register`             | Request an API token for submissions                                          |
 | `--upload FILE`          | Upload a previous results JSON                                                |
 | `--official-key KEY`     | Mark submission as official (or use `PINCHBENCH_OFFICIAL_KEY` env var)         |
+
+### Judge
+
+By default (no `--judge` flag), the LLM judge runs as an OpenClaw agent session. When `--judge` is specified, it calls the model API directly instead, bypassing OpenClaw personality injection.
+
+```bash
+# Default: OpenClaw agent session (no --judge needed)
+./scripts/run.sh --model openrouter/anthropic/claude-sonnet-4
+
+# Direct API via OpenRouter
+./scripts/run.sh --model openai/gpt-4o --judge openrouter/anthropic/claude-sonnet-4-5
+
+# Direct API via Anthropic
+./scripts/run.sh --model openai/gpt-4o --judge anthropic/claude-sonnet-4-5-20250514
+
+# Direct API via OpenAI
+./scripts/run.sh --model openai/gpt-4o --judge openai/gpt-4o
+
+# Headless Claude CLI
+./scripts/run.sh --model openai/gpt-4o --judge claude
+```
+
+Required env vars: `OPENROUTER_API_KEY`, `ANTHROPIC_API_KEY`, or `OPENAI_API_KEY` depending on the judge model prefix.
 
 ## Contributing Tasks
 

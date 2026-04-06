@@ -217,7 +217,11 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--judge",
         default=None,
-        help="Judge model identifier (default: openrouter/anthropic/claude-opus-4.5)",
+        help=(
+            "Judge model or backend. Default (unset): OpenClaw agent session with "
+            "openrouter/anthropic/claude-opus-4.5. Set to a model ID to call its API "
+            "directly (e.g. openai/gpt-4o, anthropic/claude-sonnet-4-5-20250514, claude)"
+        ),
     )
     parser.add_argument(
         "--verbose",
@@ -629,6 +633,7 @@ def main():
                 )
                 if args.judge:
                     grade_kwargs["judge_model"] = args.judge
+                    grade_kwargs["judge_backend"] = "api"
                 grade = grade_task(**grade_kwargs)
             except Exception as exc:
                 if execution_error:

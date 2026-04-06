@@ -984,3 +984,179 @@ def run_openclaw_prompt(
         "stdout": stdout,
         "stderr": stderr,
     }
+
+
+_JUDGE_SYSTEM_MSG = (
+    "You are a strict grading function. "
+    "Respond with ONLY a JSON object, no prose, no markdown fences, no extra text."
+)
+
+
+def call_judge_api(
+    *,
+    prompt: str,
+    model: str,
+    timeout_seconds: float = 120.0,
+) -> Dict[str, Any]:
+    """Call a judge model directly via API, bypassing OpenClaw.
+
+    Dispatches based on model prefix:
+      - openrouter/* -> OpenRouter chat completions API
+      - anthropic/*  -> Anthropic Messages API
+      - openai/*     -> OpenAI chat completions API
+      - claude       -> headless Claude CLI (claude -p)
+
+    Returns {"status": str, "text": str, "error"?: str}.
+    """
+    if model == "claude" or model.startswith("claude:"):
+        return _judge_via_claude_cli(prompt, model, timeout_seconds)
+    if model.startswith("anthropic/"):
+        return _judge_via_anthropic(prompt, model, timeout_seconds)
+    if model.startswith("openai/"):
+        return _judge_via_openai(prompt, model, timeout_seconds)
+    # Default: OpenRouter (handles openrouter/ prefix and bare provider/model)
+    return _judge_via_openrouter(prompt, model, timeout_seconds)
+
+
+def _judge_via_openai_compat(
+    prompt: str,
+    api_model: str,
+    endpoint: str,
+    api_key: str,
+    timeout_seconds: float,
+    extra_headers: Optional[Dict[str, str]] = None,
+) -> Dict[str, Any]:
+    """Shared implementation for OpenAI-compatible chat completions APIs."""
+    payload = json.dumps({
+        "model": api_model,
+        "messages": [
+            {"role": "system", "content": _JUDGE_SYSTEM_MSG},
+            {"role": "user", "content": prompt},
+        ],
+        "temperature": 0.0,
+        "max_tokens": 2048,
+    }).encode("utf-8")
+
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+    }
+    if extra_headers:
+        headers.update(extra_headers)
+
+    req = request.Request(endpoint, data=payload, headers=headers, method="POST")
+    try:
+        with request.urlopen(req, timeout=timeout_seconds) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+    except error.HTTPError as exc:
+        body = ""
+        try:
+            body = exc.read().decode("utf-8", errors="replace")[:500]
+        except Exception:
+            pass
+        logger.error("Judge API error (%s): %s", exc.code, body)
+        return {"status": "error", "text": "", "error": f"HTTP {exc.code}: {body}"}
+    except error.URLError as exc:
+        logger.error("Judge network error: %s", exc)
+        return {"status": "error", "text": "", "error": str(exc)}
+    except TimeoutError:
+        return {"status": "timeout", "text": "", "error": "Request timed out"}
+
+    choices = data.get("choices", [])
+    if not choices:
+        return {"status": "error", "text": "", "error": "No choices in response"}
+    text = choices[0].get("message", {}).get("content", "")
+    return {"status": "success", "text": text}
+
+
+def _judge_via_openrouter(prompt: str, model: str, timeout_seconds: float) -> Dict[str, Any]:
+    api_key = os.environ.get("OPENROUTER_API_KEY")
+    if not api_key:
+        return {"status": "error", "text": "", "error": "OPENROUTER_API_KEY not set"}
+    bare_model = model.removeprefix("openrouter/")
+    return _judge_via_openai_compat(
+        prompt, bare_model,
+        "https://openrouter.ai/api/v1/chat/completions",
+        api_key, timeout_seconds,
+        extra_headers={"HTTP-Referer": "https://pinchbench.com", "X-Title": "PinchBench-Judge"},
+    )
+
+
+def _judge_via_openai(prompt: str, model: str, timeout_seconds: float) -> Dict[str, Any]:
+    api_key = os.environ.get("OPENAI_API_KEY")
+    if not api_key:
+        return {"status": "error", "text": "", "error": "OPENAI_API_KEY not set"}
+    bare_model = model.removeprefix("openai/")
+    return _judge_via_openai_compat(
+        prompt, bare_model,
+        "https://api.openai.com/v1/chat/completions",
+        api_key, timeout_seconds,
+    )
+
+
+def _judge_via_anthropic(prompt: str, model: str, timeout_seconds: float) -> Dict[str, Any]:
+    api_key = os.environ.get("ANTHROPIC_API_KEY")
+    if not api_key:
+        return {"status": "error", "text": "", "error": "ANTHROPIC_API_KEY not set"}
+    bare_model = model.removeprefix("anthropic/")
+    payload = json.dumps({
+        "model": bare_model,
+        "max_tokens": 2048,
+        "temperature": 0.0,
+        "system": _JUDGE_SYSTEM_MSG,
+        "messages": [{"role": "user", "content": prompt}],
+    }).encode("utf-8")
+    headers = {
+        "x-api-key": api_key,
+        "Content-Type": "application/json",
+        "anthropic-version": "2023-06-01",
+    }
+    req = request.Request(
+        "https://api.anthropic.com/v1/messages",
+        data=payload, headers=headers, method="POST",
+    )
+    try:
+        with request.urlopen(req, timeout=timeout_seconds) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+    except error.HTTPError as exc:
+        body = ""
+        try:
+            body = exc.read().decode("utf-8", errors="replace")[:500]
+        except Exception:
+            pass
+        logger.error("Anthropic judge API error (%s): %s", exc.code, body)
+        return {"status": "error", "text": "", "error": f"HTTP {exc.code}: {body}"}
+    except error.URLError as exc:
+        logger.error("Anthropic judge network error: %s", exc)
+        return {"status": "error", "text": "", "error": str(exc)}
+    except TimeoutError:
+        return {"status": "timeout", "text": "", "error": "Request timed out"}
+
+    content = data.get("content", [])
+    text = "".join(block.get("text", "") for block in content if block.get("type") == "text")
+    return {"status": "success", "text": text}
+
+
+def _judge_via_claude_cli(prompt: str, model: str, timeout_seconds: float) -> Dict[str, Any]:
+    """Use headless Claude CLI (claude -p) as judge."""
+    cmd: List[str] = ["claude", "-p"]
+    # Support "claude:model-name" to pass --model
+    if ":" in model:
+        _, cli_model = model.split(":", 1)
+        cmd.extend(["--model", cli_model])
+    try:
+        result = subprocess.run(
+            cmd,
+            input=f"{_JUDGE_SYSTEM_MSG}\n\n{prompt}",
+            capture_output=True,
+            text=True,
+            timeout=timeout_seconds,
+            check=False,
+        )
+    except FileNotFoundError:
+        return {"status": "error", "text": "", "error": "claude CLI not found"}
+    except subprocess.TimeoutExpired:
+        return {"status": "timeout", "text": "", "error": "claude -p timed out"}
+    if result.returncode != 0:
+        return {"status": "error", "text": "", "error": f"claude exit {result.returncode}: {result.stderr[:300]}"}
+    return {"status": "success", "text": result.stdout}
