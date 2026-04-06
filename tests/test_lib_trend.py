@@ -5,7 +5,7 @@ import time
 from pathlib import Path
 from unittest import TestCase
 
-from scripts.lib_trend import RunTrendAnalyzer, RunPoint, RunTrendReport
+from scripts.lib_trend import RunTrendAnalyzer, RunTrendReport
 
 
 class TestRunTrendAnalyzer(TestCase):

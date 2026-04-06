@@ -7,7 +7,7 @@ performance is improving, stable, or degrading over time via OLS slope fitting.
 import json
 import logging
 import statistics
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Optional
 
