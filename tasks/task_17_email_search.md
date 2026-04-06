@@ -403,7 +403,7 @@ workspace_files:
 
 ## Prompt
 
-You have access to a collection of emails in the `emails/` folder in your workspace (12 email files with dates in their filenames). Search through all the emails to find everything related to "Project Alpha" and create a comprehensive summary document.
+You have access to a collection of emails in the `emails/` folder in your workspace (11 email files with dates in their filenames). Search through all the emails to find everything related to "Project Alpha" and create a comprehensive summary document.
 
 Save the summary to alpha_summary.md with the following sections:
 
@@ -418,7 +418,7 @@ Save the summary to alpha_summary.md with the following sections:
 The agent should:
 
 1. Discover and read all email files in the `emails/` directory
-2. Identify which emails are related to Project Alpha (10 of 12 are relevant; 2 are unrelated noise)
+2. Identify which emails are related to Project Alpha (9 of 11 are relevant; 2 are unrelated noise)
 3. Filter out unrelated emails (team lunch, conference promo)
 4. Synthesize information across multiple emails into a coherent narrative
 5. Track how information evolved over time (e.g., budget went from $340K to $410K, timeline slipped)
@@ -713,7 +713,7 @@ def grade(transcript: list, workspace_path: str) -> dict:
 
 This task tests a practical knowledge-worker scenario: searching through a collection of project-related emails and producing an executive summary. Key challenges include:
 
-1. **Search and filtering**: The agent must identify which emails are relevant to the query and exclude noise (2 of 12 emails are unrelated)
+1. **Search and filtering**: The agent must identify which emails are relevant to the query and exclude noise (2 of 11 emails are unrelated)
 2. **Temporal tracking**: Information evolves across emails - the budget changes, timeline slips, and project status progresses. The agent must track these changes rather than treating each email in isolation
 3. **Cross-referencing**: Multiple emails reference the same topics (e.g., security findings appear in the security review email AND the timeline update email). A good summary connects these
 4. **Synthesis vs. summarization**: The task asks for a thematic summary organized by topic, not a chronological list of emails. This requires reorganizing information from its source structure
