@@ -88,6 +88,10 @@ class RunTrendAnalyzer:
             except (json.JSONDecodeError, OSError):
                 continue
 
+            # Skip incomplete runs (written incrementally during benchmark)
+            if data.get("in_progress"):
+                continue
+
             m = data.get("model", "")
             ts = data.get("timestamp", 0.0)
             run_id = data.get("run_id", path.stem)
