@@ -251,7 +251,20 @@ def _parse_args() -> argparse.Namespace:
         action="store_true",
         help="Continue running all tasks even if sanity check scores 0%%",
     )
-    return parser.parse_args()
+    parser.add_argument(
+        "--trend-window",
+        type=int,
+        default=None,
+        metavar="N",
+        help="Analyze score trends over the last N runs after benchmarking (requires ≥2 runs)",
+    )
+    args = parser.parse_args()
+
+    # Validate --trend-window
+    if args.trend_window is not None and args.trend_window < 2:
+        parser.error("--trend-window must be >= 2")
+
+    return args
 
 
 def _select_task_ids(tasks: List[Task], suite: str) -> Optional[List[str]]:
@@ -832,6 +845,19 @@ def main():
     logger.info("Saved results to %s", output_path)
     _log_category_summary(task_entries, tasks_by_id)
     _log_efficiency_summary(efficiency, grades_by_task_id)
+    # Run trend analysis if requested
+    if args.trend_window is not None:
+        try:
+            from lib_trend import RunTrendAnalyzer
+
+            analyzer = RunTrendAnalyzer(
+                results_dir=output_dir,
+                window=args.trend_window,
+            )
+            analyzer.run(model=args.model)
+        except Exception as exc:
+            logger.warning("Trend analysis failed: %s", exc)
+
     if args.no_upload:
         logger.info("Skipping upload (--no-upload)")
     else:
