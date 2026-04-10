@@ -17,6 +17,7 @@ import importlib.metadata
 import json
 import logging
 import os
+import re
 import statistics
 import subprocess
 import sys
@@ -324,9 +325,27 @@ def _get_benchmark_version(script_dir: Path) -> str:
         except Exception:
             pass
 
+    def _split_semver(tag: str) -> Optional[tuple[int, int, int]]:
+        cleaned = tag.strip()
+        if cleaned.startswith("v"):
+            cleaned = cleaned[1:]
+        match = re.match(r"^(\d+)\.(\d+)\.(\d+)$", cleaned)
+        if not match:
+            return None
+        return int(match.group(1)), int(match.group(2)), int(match.group(3))
+
     try:
         result = subprocess.run(
-            ["git", "describe", "--tags", "--abbrev=0"],
+            [
+                "git",
+                "describe",
+                "--tags",
+                "--long",
+                "--match",
+                "v[0-9]*.[0-9]*.[0-9]*",
+                "--match",
+                "[0-9]*.[0-9]*.[0-9]*",
+            ],
             capture_output=True,
             text=True,
             timeout=2,
@@ -334,7 +353,21 @@ def _get_benchmark_version(script_dir: Path) -> str:
             cwd=script_dir,
         )
         if result.returncode == 0:
-            return result.stdout.strip()
+            described = result.stdout.strip()
+            describe_match = re.match(r"^(.+)-(\d+)-g([0-9a-fA-F]+)$", described)
+            if describe_match:
+                raw_tag = describe_match.group(1)
+                commit_distance = int(describe_match.group(2))
+                short_sha = describe_match.group(3)
+                parsed_tag = _split_semver(raw_tag)
+                if parsed_tag is not None:
+                    major, minor, patch = parsed_tag
+                    if commit_distance == 0:
+                        return f"{major}.{minor}.{patch}"
+                    next_patch = patch + 1
+                    return f"{major}.{minor}.{next_patch}-dev.{commit_distance}+g{short_sha}"
+            if described:
+                return described
     except (subprocess.SubprocessError, FileNotFoundError, OSError):
         pass
 
@@ -637,8 +670,11 @@ def main():
             sys.exit(1)
 
     ensure_agent_exists(
-        agent_id, args.model, agent_workspace,
-        base_url=args.base_url, api_key=args.api_key,
+        agent_id,
+        args.model,
+        agent_workspace,
+        base_url=args.base_url,
+        api_key=args.api_key,
     )
     cleanup_agent_sessions(agent_id)
 
