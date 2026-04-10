@@ -5,8 +5,8 @@ category: calendar
 grading_type: automated
 timeout_seconds: 180
 workspace_files:
-  - path: school-calendar.pdf
-    url: https://raw.githubusercontent.com/chad-kiloclaw/openclaw-workspace/master/mlk-elementary-2026-2027.pdf
+  - source: mlk-elementary-2026-2027.pdf
+    dest: school-calendar.pdf
 ---
 
 ## Prompt
