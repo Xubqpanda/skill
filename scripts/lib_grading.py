@@ -293,6 +293,17 @@ def _grade_llm_judge(
     breakdown = parsed.get("scores", {})
     total = parsed.get("total")
     notes = parsed.get("notes", "")
+
+    if not raw_parsed:
+        notes = "LLM judge failed: no parseable response after all attempts"
+        logger.warning("LLM judge for %s produced no parseable output", task.task_id)
+    elif total is None:
+        notes = "LLM judge failed: response parsed but no score extracted"
+        logger.warning(
+            "LLM judge for %s: parsed response but no total score found: %s",
+            task.task_id,
+            raw_parsed,
+        )
     return GradeResult(
         task_id=task.task_id,
         score=float(total) if total is not None else 0.0,
@@ -628,7 +639,9 @@ def _parse_judge_text(raw_text: str) -> Dict[str, Any]:
         except ValueError:
             pass
 
-    logger.warning("Failed to parse judge text response")
+    logger.warning(
+        "Failed to parse judge text response. Raw text (first 500 chars): %s", raw_text[:500]
+    )
     return {}
 
 
