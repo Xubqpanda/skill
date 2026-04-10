@@ -750,6 +750,9 @@ def execute_openclaw_task(
         else:
             fws_env = start_fws()
 
+    # Use --local for fws tasks so env vars propagate to the agent
+    use_local = fws_env is not None
+
     start_time = time.time()
     workspace = prepare_task_workspace(skill_dir, run_id, task, agent_id)
     session_id = f"{task.task_id}_{int(time.time() * 1000)}"
@@ -781,8 +784,7 @@ def execute_openclaw_task(
                 timed_out = True
                 break
             try:
-                result = subprocess.run(
-                    [
+                cmd = [
                         "openclaw",
                         "agent",
                         "--agent",
@@ -791,13 +793,17 @@ def execute_openclaw_task(
                         session_id,
                         "--message",
                         session_prompt,
-                    ],
+                    ]
+                if use_local:
+                    cmd.insert(2, "--local")
+                result = subprocess.run(
+                    cmd,
                     capture_output=True,
                     text=True,
                     cwd=str(workspace),
                     timeout=remaining,
                     check=False,
-            shell=USE_SHELL,
+                    shell=USE_SHELL,
                 )
                 stdout += result.stdout
                 stderr += result.stderr
@@ -815,8 +821,7 @@ def execute_openclaw_task(
     else:
         # Single-session task: send task.prompt once
         try:
-            result = subprocess.run(
-                [
+            cmd = [
                     "openclaw",
                     "agent",
                     "--agent",
@@ -825,13 +830,17 @@ def execute_openclaw_task(
                     session_id,
                     "--message",
                     task.prompt,
-                ],
+                ]
+            if use_local:
+                cmd.insert(2, "--local")
+            result = subprocess.run(
+                cmd,
                 capture_output=True,
                 text=True,
                 cwd=str(workspace),
                 timeout=timeout_seconds,
                 check=False,
-            shell=USE_SHELL,
+                shell=USE_SHELL,
             )
             stdout = result.stdout
             stderr = result.stderr
