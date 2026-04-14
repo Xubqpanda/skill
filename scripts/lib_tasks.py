@@ -78,14 +78,20 @@ class TaskLoader:
 
     def __init__(self, tasks_dir: Path):
         self.tasks_dir = tasks_dir
+        self.category_map: Dict[str, str] = {}  # task_id -> category from manifest
+        self.categories: List[str] = []  # ordered list of category names
         logger.info(f"Initialized TaskLoader with directory: {tasks_dir}")
 
     def load_all_tasks(self) -> List[Task]:
         """Load all task files from the tasks directory.
 
         If a ``manifest.yaml`` file exists in the tasks directory, it is used
-        to determine which tasks to load and in what order.  Otherwise, task
-        files are discovered via glob and sorted alphabetically (fallback).
+        to determine which tasks to load and in what order.  The manifest may
+        use a flat ``tasks`` list (legacy) or a ``categories`` mapping that
+        groups tasks by category.
+
+        When using the categorized format, a ``run_first`` list can specify
+        tasks that must execute before all others regardless of their category.
         """
         manifest_path = self.tasks_dir / "manifest.yaml"
         if manifest_path.exists():
@@ -93,9 +99,24 @@ class TaskLoader:
         return self._load_from_glob()
 
     def _load_from_manifest(self, manifest_path: Path) -> List[Task]:
-        """Load tasks in the order specified by the manifest."""
+        """Load tasks in the order specified by the manifest.
+
+        Supports both the legacy flat format (``tasks: [...]``) and the new
+        categorized format (``categories: {cat: [...], ...}``).  When the
+        categorized format is detected, ``self.category_map`` is populated
+        with task_id → category mappings and ``self.categories`` is set to
+        the ordered list of category names.
+        """
         manifest = yaml.safe_load(manifest_path.read_text(encoding="utf-8"))
-        task_ids: List[str] = manifest.get("tasks", [])
+
+        if "categories" in manifest:
+            task_ids = self._parse_categorized_manifest(manifest)
+        else:
+            # Legacy flat format
+            task_ids = manifest.get("tasks", [])
+            self.category_map = {}
+            self.categories = []
+
         logger.info(f"Manifest lists {len(task_ids)} tasks")
 
         tasks = []
@@ -106,6 +127,9 @@ class TaskLoader:
                 continue
             try:
                 task = self.load_task(task_file)
+                # Override frontmatter category with manifest category if available
+                if task.task_id in self.category_map:
+                    task.category = self.category_map[task.task_id]
                 tasks.append(task)
                 logger.info(f"Successfully loaded task: {task.task_id}")
             except Exception as e:
@@ -113,6 +137,36 @@ class TaskLoader:
 
         logger.info(f"Successfully loaded {len(tasks)} tasks")
         return tasks
+
+    def _parse_categorized_manifest(self, manifest: Dict[str, Any]) -> List[str]:
+        """Parse the categorized manifest format and return an ordered task list.
+
+        Populates ``self.category_map`` and ``self.categories``.  Tasks listed
+        in ``run_first`` are placed at the front of the returned list while
+        preserving their category membership.
+        """
+        run_first: List[str] = manifest.get("run_first", [])
+        categories: Dict[str, List[str]] = manifest.get("categories", {})
+
+        self.categories = list(categories.keys())
+        self.category_map = {}
+
+        # Build category map from all categories
+        all_task_ids: List[str] = []
+        for category, ids in categories.items():
+            for task_id in ids or []:
+                self.category_map[task_id] = category
+                all_task_ids.append(task_id)
+
+        # Build ordered list: run_first tasks come first, then the rest
+        # in category order (skipping any already pulled to the front).
+        run_first_set = set(run_first)
+        ordered: List[str] = list(run_first)
+        for task_id in all_task_ids:
+            if task_id not in run_first_set:
+                ordered.append(task_id)
+
+        return ordered
 
     def _load_from_glob(self) -> List[Task]:
         """Fallback: discover task files via glob (alphabetical order)."""

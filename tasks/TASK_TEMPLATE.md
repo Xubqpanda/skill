@@ -1,7 +1,7 @@
 ---
 id: task_descriptive_name
 name: Task Display Name
-category: category_name
+category: category_name # must match the manifest.yaml category this task is listed under
 grading_type: automated # automated | llm_judge | hybrid
 timeout_seconds: 120
 workspace_files: []
