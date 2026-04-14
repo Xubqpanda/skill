@@ -124,3 +124,6 @@ tasks:
   - task_byok_best_practices
   - task_cron_organizer
   - task_subway_navigation
+  - task_csv_pension_ranking
+  - task_csv_pension_liability
+  - task_csv_pension_risk
