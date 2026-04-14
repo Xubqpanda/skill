@@ -1,5 +1,5 @@
 ---
-id: task_35_multi_file_refactoring
+id: task_multi_file_refactoring
 name: Multi-file Refactoring
 category: developer
 grading_type: automated

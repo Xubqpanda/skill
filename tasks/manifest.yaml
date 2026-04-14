@@ -41,3 +41,4 @@ tasks:
   - task_shell_command_generator
   - task_git_rescue_recovery
   - task_contract_analysis
+  - task_multi_file_refactoring
