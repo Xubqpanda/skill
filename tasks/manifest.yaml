@@ -59,3 +59,7 @@ tasks:
   - task_gh_issue_triage
   - task_pdf_to_calendar
   - task_cve_security_triage
+
+  - task_csv_stations_by_elevation
+  - task_csv_stations_coverage
+  - task_csv_stations_filter
