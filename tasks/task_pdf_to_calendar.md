@@ -1,5 +1,5 @@
 ---
-id: task_35_pdf_to_calendar
+id: task_pdf_to_calendar
 name: PDF to Calendar Import
 category: calendar
 grading_type: automated

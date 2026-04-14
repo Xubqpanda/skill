@@ -45,3 +45,4 @@ tasks:
   - task_gws_cross_service
   - task_gws_task_management
   - task_gh_issue_triage
+  - task_pdf_to_calendar
