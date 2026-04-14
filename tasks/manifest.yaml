@@ -59,3 +59,8 @@ tasks:
   - task_gh_issue_triage
   - task_pdf_to_calendar
   - task_cve_security_triage
+  - task_meeting_tech_action_items
+  - task_meeting_tech_decisions
+  - task_meeting_tech_competitors
+  - task_meeting_tech_messaging
+  - task_meeting_tech_product_features
