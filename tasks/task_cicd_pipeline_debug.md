@@ -121,7 +121,7 @@ def grade(transcript: list, workspace_path: str) -> dict:
         if stripped.startswith("deploy:"):
             in_deploy = True
             deploy_section = ""
-        elif in_deploy and re.match(r"^\S+:", stripped) and not stripped.startswith("deploy:"):
+        elif in_deploy and re.match(r"^\S+:", line) and not line.startswith("deploy:"):
             # Reached next top-level job
             break
         if in_deploy:
