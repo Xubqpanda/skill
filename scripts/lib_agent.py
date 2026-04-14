@@ -16,6 +16,7 @@ from typing import Any, Dict, List, Optional
 from urllib import error, request
 
 from lib_tasks import Task
+from lib_fws import is_fws_task, fws_available, start_fws, stop_fws
 
 
 logger = logging.getLogger(__name__)
@@ -741,6 +742,17 @@ def execute_openclaw_task(
     # transcript (OpenClaw uses its own UUID-based naming, not our session ID).
     cleanup_agent_sessions(agent_id)
 
+    # Start fws server for GWS tasks
+    fws_env = None
+    if is_fws_task(task.frontmatter):
+        if not fws_available():
+            logger.warning("⚠️ Task %s requires fws but it's not installed (npm install -g @juppytt/fws)", task.task_id)
+        else:
+            fws_env = start_fws()
+
+    # Use --local for fws tasks so env vars propagate to the agent
+    use_local = fws_env is not None
+
     start_time = time.time()
     workspace = prepare_task_workspace(skill_dir, run_id, task, agent_id)
     session_id = f"{task.task_id}_{int(time.time() * 1000)}"
@@ -772,8 +784,7 @@ def execute_openclaw_task(
                 timed_out = True
                 break
             try:
-                result = subprocess.run(
-                    [
+                cmd = [
                         "openclaw",
                         "agent",
                         "--agent",
@@ -782,13 +793,17 @@ def execute_openclaw_task(
                         session_id,
                         "--message",
                         session_prompt,
-                    ],
+                    ]
+                if use_local:
+                    cmd.insert(2, "--local")
+                result = subprocess.run(
+                    cmd,
                     capture_output=True,
                     text=True,
                     cwd=str(workspace),
                     timeout=remaining,
                     check=False,
-            shell=USE_SHELL,
+                    shell=USE_SHELL,
                 )
                 stdout += result.stdout
                 stderr += result.stderr
@@ -806,8 +821,7 @@ def execute_openclaw_task(
     else:
         # Single-session task: send task.prompt once
         try:
-            result = subprocess.run(
-                [
+            cmd = [
                     "openclaw",
                     "agent",
                     "--agent",
@@ -816,13 +830,17 @@ def execute_openclaw_task(
                     session_id,
                     "--message",
                     task.prompt,
-                ],
+                ]
+            if use_local:
+                cmd.insert(2, "--local")
+            result = subprocess.run(
+                cmd,
                 capture_output=True,
                 text=True,
                 cwd=str(workspace),
                 timeout=timeout_seconds,
                 check=False,
-            shell=USE_SHELL,
+                shell=USE_SHELL,
             )
             stdout = result.stdout
             stderr = result.stderr
@@ -894,6 +912,10 @@ def execute_openclaw_task(
                         logger.info("      %s (%d bytes)", f.relative_to(workspace), size)
                     except OSError:
                         logger.info("      %s", f.relative_to(workspace))
+
+    # Stop fws mock server if we started it
+    if fws_env is not None:
+        stop_fws(fws_env)
 
     return {
         "agent_id": agent_id,

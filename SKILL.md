@@ -3,7 +3,7 @@ name: pinchbench
 description: Run PinchBench benchmarks to evaluate OpenClaw agent performance across real-world tasks. Use when testing model capabilities, comparing models, submitting benchmark results to the leaderboard, or checking how well your OpenClaw setup handles calendar, email, research, coding, and multi-step workflows.
 metadata:
   author: pinchbench
-  version: "1.0.0"
+  version: "2.0.0-rc1"
   homepage: https://pinchbench.com
   repository: https://github.com/pinchbench/skill
 ---

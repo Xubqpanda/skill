@@ -45,3 +45,13 @@ tasks:
   - task_test_generation
   - task_k8s_debugging
   - task_selector_fix
+  - task_dockerfile_optimization
+  - task_commit_message_writer
+  - task_readme_generation
+  - task_multi_file_refactoring
+  - task_gws_email_triage
+  - task_gws_cross_service
+  - task_gws_task_management
+  - task_gh_issue_triage
+  - task_pdf_to_calendar
+  - task_cve_security_triage
