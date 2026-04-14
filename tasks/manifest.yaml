@@ -93,3 +93,8 @@ tasks:
   - task_csv_stations_by_elevation
   - task_csv_stations_coverage
   - task_csv_stations_filter
+  - task_log_apache_client_issues
+  - task_log_apache_top_errors
+  - task_log_apache_error_summary
+  - task_log_apache_critical
+  - task_log_apache_timeline
