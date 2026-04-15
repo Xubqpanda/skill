@@ -59,6 +59,14 @@ tasks:
   - task_gh_issue_triage
   - task_pdf_to_calendar
   - task_cve_security_triage
+  - task_csv_gdp_ranking
+  - task_csv_gdp_per_capita
+  - task_csv_gdp_regions
+  - task_meeting_tech_action_items
+  - task_meeting_tech_decisions
+  - task_meeting_tech_competitors
+  - task_meeting_tech_messaging
+  - task_meeting_tech_product_features
   - task_meeting_executive_summary
   - task_meeting_sentiment_analysis
   - task_meeting_follow_up_email
