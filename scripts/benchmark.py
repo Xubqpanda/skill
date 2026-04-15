@@ -13,9 +13,11 @@ from the tasks/ directory.
 # ///
 
 import argparse
+import importlib.metadata
 import json
 import logging
 import os
+import re
 import statistics
 import subprocess
 import sys
@@ -217,7 +219,21 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--judge",
         default=None,
-        help="Judge model identifier (default: openrouter/anthropic/claude-opus-4.5)",
+        help=(
+            "Judge model or backend. Default (unset): OpenClaw agent session with "
+            "openrouter/anthropic/claude-opus-4.5. Set to a model ID to call its API "
+            "directly (e.g. openai/gpt-4o, anthropic/claude-sonnet-4-5-20250514, claude)"
+        ),
+    )
+    parser.add_argument(
+        "--base-url",
+        default=None,
+        help="Custom OpenAI-compatible API base URL (bypasses OpenRouter validation)",
+    )
+    parser.add_argument(
+        "--api-key",
+        default=None,
+        help="API key for custom endpoint (default: $OPENAI_API_KEY env var)",
     )
     parser.add_argument(
         "--verbose",
@@ -236,7 +252,31 @@ def _parse_args() -> argparse.Namespace:
         action="store_true",
         help="Continue running all tasks even if sanity check scores 0%%",
     )
-    return parser.parse_args()
+    parser.add_argument(
+        "--trend",
+        action="store_true",
+        help="Run trend analysis after benchmark completes (requires ≥2 runs in output dir)",
+    )
+    parser.add_argument(
+        "--trend-window",
+        type=int,
+        default=10,
+        metavar="N",
+        help="Number of recent runs to include in trend analysis (default: 10)",
+    )
+    parser.add_argument(
+        "--trend-threshold",
+        type=float,
+        default=-0.5,
+        help="Slope (%%/run) below which regression is flagged (default: -0.5)",
+    )
+    args = parser.parse_args()
+
+    # Validate --trend-window
+    if args.trend_window < 2:
+        parser.error("--trend-window must be >= 2")
+
+    return args
 
 
 def _select_task_ids(tasks: List[Task], suite: str) -> Optional[List[str]]:
@@ -272,7 +312,65 @@ def _supports_truecolor() -> bool:
     return sys.stdout.isatty()
 
 
-def _get_git_version(script_dir: Path) -> str:
+def _get_benchmark_version(script_dir: Path) -> str:
+    try:
+        return importlib.metadata.version("pinchbench")
+    except Exception:
+        pass
+
+    version_file = script_dir / "BENCHMARK_VERSION"
+    if version_file.is_file():
+        try:
+            return version_file.read_text().strip()
+        except Exception:
+            pass
+
+    def _split_semver(tag: str) -> Optional[tuple[int, int, int]]:
+        cleaned = tag.strip()
+        if cleaned.startswith("v"):
+            cleaned = cleaned[1:]
+        match = re.match(r"^(\d+)\.(\d+)\.(\d+)$", cleaned)
+        if not match:
+            return None
+        return int(match.group(1)), int(match.group(2)), int(match.group(3))
+
+    try:
+        result = subprocess.run(
+            [
+                "git",
+                "describe",
+                "--tags",
+                "--long",
+                "--match",
+                "v[0-9]*.[0-9]*.[0-9]*",
+                "--match",
+                "[0-9]*.[0-9]*.[0-9]*",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=2,
+            check=False,
+            cwd=script_dir,
+        )
+        if result.returncode == 0:
+            described = result.stdout.strip()
+            describe_match = re.match(r"^(.+)-(\d+)-g([0-9a-fA-F]+)$", described)
+            if describe_match:
+                raw_tag = describe_match.group(1)
+                commit_distance = int(describe_match.group(2))
+                short_sha = describe_match.group(3)
+                parsed_tag = _split_semver(raw_tag)
+                if parsed_tag is not None:
+                    major, minor, patch = parsed_tag
+                    if commit_distance == 0:
+                        return f"{major}.{minor}.{patch}"
+                    next_patch = patch + 1
+                    return f"{major}.{minor}.{next_patch}-dev.{commit_distance}+g{short_sha}"
+            if described:
+                return described
+    except (subprocess.SubprocessError, FileNotFoundError, OSError):
+        pass
+
     try:
         result = subprocess.run(
             ["git", "rev-parse", "--short", "HEAD"],
@@ -562,19 +660,28 @@ def main():
     agent_workspace = Path(f"/tmp/pinchbench/{run_id}/agent_workspace")
 
     # Validate model exists before wasting time on tasks
-    try:
-        validate_openrouter_model(args.model)
-    except ModelValidationError as exc:
-        logger.error("❌ %s", exc)
-        sys.exit(1)
+    if args.base_url:
+        logger.info("Using custom endpoint: %s (skipping OpenRouter validation)", args.base_url)
+    else:
+        try:
+            validate_openrouter_model(args.model)
+        except ModelValidationError as exc:
+            logger.error("❌ %s", exc)
+            sys.exit(1)
 
-    ensure_agent_exists(agent_id, args.model, agent_workspace)
+    ensure_agent_exists(
+        agent_id,
+        args.model,
+        agent_workspace,
+        base_url=args.base_url,
+        api_key=args.api_key,
+    )
     cleanup_agent_sessions(agent_id)
 
     task_ids = _select_task_ids(runner.tasks, args.suite)
     results = []
     grades_by_task_id = {}
-    sanity_task_id = "task_00_sanity"
+    sanity_task_id = "task_sanity"
 
     tasks_to_run = runner.tasks
     if task_ids is not None:
@@ -582,6 +689,47 @@ def main():
     tasks_by_id = {task.task_id: task for task in tasks_to_run}
 
     runs_per_task = max(1, args.runs)
+
+    # Incremental result writer: builds partial result JSON from completed
+    # tasks so external tools can poll progress while the benchmark runs.
+    incremental_dir = Path(args.output_dir)
+    incremental_dir.mkdir(parents=True, exist_ok=True)
+    incremental_path = incremental_dir / f"{run_id}_{model_slug}.json"
+
+    def _write_incremental_results():
+        task_entries = [
+            {
+                "task_id": r["task_id"],
+                "status": r["status"],
+                "timed_out": r["timed_out"],
+                "execution_time": r["execution_time"],
+                "transcript_length": len(r["transcript"]),
+                "usage": r.get("usage", {}),
+                "workspace": r["workspace"],
+                "grading": grades_by_task_id.get(r["task_id"], {}),
+                "frontmatter": tasks_by_id[r["task_id"]].frontmatter,
+            }
+            for r in results
+        ]
+        efficiency = _compute_efficiency_summary(task_entries, grades_by_task_id)
+        partial = {
+            "model": args.model,
+            "benchmark_version": _get_benchmark_version(skill_root),
+            "run_id": run_id,
+            "timestamp": time.time(),
+            "suite": args.suite,
+            "runs_per_task": runs_per_task,
+            "tasks": task_entries,
+            "efficiency": efficiency,
+            "in_progress": True,
+            "completed_tasks": len(grades_by_task_id),
+            "total_tasks": len(tasks_to_run),
+        }
+        try:
+            incremental_path.write_text(json.dumps(partial, indent=2), encoding="utf-8")
+        except OSError:
+            pass
+
     for i, task in enumerate(tasks_to_run, 1):
         task_grades = []
         task_results = []
@@ -604,6 +752,7 @@ def main():
                     run_id=f"{run_id}-{run_index + 1}",
                     timeout_multiplier=args.timeout_multiplier,
                     skill_dir=skill_dir,
+                    output_dir=Path(args.output_dir) / f"{run_id}_transcripts",
                     verbose=args.verbose,
                 )
             except Exception as exc:
@@ -628,6 +777,7 @@ def main():
                 )
                 if args.judge:
                     grade_kwargs["judge_model"] = args.judge
+                    grade_kwargs["judge_backend"] = "api"
                 grade = grade_task(**grade_kwargs)
             except Exception as exc:
                 if execution_error:
@@ -693,39 +843,45 @@ def main():
                     "⚠️ Sanity check scored 0%% but transcripts were missing for all runs; skipping fail-fast as likely infrastructure/logging issue."
                 )
 
+        # Incremental write: update result JSON after each task so partial
+        # results are available while the benchmark is still running.
+        _write_incremental_results()
+
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
-
-    task_entries = [
-        {
-            "task_id": result["task_id"],
-            "status": result["status"],
-            "timed_out": result["timed_out"],
-            "execution_time": result["execution_time"],
-            "transcript_length": len(result["transcript"]),
-            "usage": result.get("usage", {}),
-            "workspace": result["workspace"],
-            "grading": grades_by_task_id[result["task_id"]],
-            "frontmatter": tasks_by_id[result["task_id"]].frontmatter,
-        }
-        for result in results
-    ]
-
-    efficiency = _compute_efficiency_summary(task_entries, grades_by_task_id)
-
-    aggregate = {
-        "model": args.model,
-        "benchmark_version": _get_git_version(skill_root),
-        "run_id": run_id,
-        "timestamp": time.time(),
-        "suite": args.suite,
-        "runs_per_task": runs_per_task,
-        "tasks": task_entries,
-        "efficiency": efficiency,
-    }
-
     output_path = output_dir / f"{run_id}_{model_slug}.json"
-    output_path.write_text(json.dumps(aggregate, indent=2), encoding="utf-8")
+
+    def _build_and_write_results():
+        """Build aggregate result from completed tasks and write to output_path."""
+        task_entries = [
+            {
+                "task_id": result["task_id"],
+                "status": result["status"],
+                "timed_out": result["timed_out"],
+                "execution_time": result["execution_time"],
+                "transcript_length": len(result["transcript"]),
+                "usage": result.get("usage", {}),
+                "workspace": result["workspace"],
+                "grading": grades_by_task_id[result["task_id"]],
+                "frontmatter": tasks_by_id[result["task_id"]].frontmatter,
+            }
+            for result in results
+        ]
+        efficiency = _compute_efficiency_summary(task_entries, grades_by_task_id)
+        aggregate = {
+            "model": args.model,
+            "benchmark_version": _get_benchmark_version(skill_root),
+            "run_id": run_id,
+            "timestamp": time.time(),
+            "suite": args.suite,
+            "runs_per_task": runs_per_task,
+            "tasks": task_entries,
+            "efficiency": efficiency,
+        }
+        output_path.write_text(json.dumps(aggregate, indent=2), encoding="utf-8")
+        return task_entries, efficiency
+
+    task_entries, efficiency = _build_and_write_results()
 
     # Calculate and log final score summary
     total_score = sum(grades_by_task_id[tid]["mean"] for tid in grades_by_task_id)
@@ -736,6 +892,20 @@ def main():
     logger.info("Saved results to %s", output_path)
     _log_category_summary(task_entries, tasks_by_id)
     _log_efficiency_summary(efficiency, grades_by_task_id)
+    # Run trend analysis if requested
+    if args.trend:
+        try:
+            from lib_trend import RunTrendAnalyzer
+
+            analyzer = RunTrendAnalyzer(
+                results_dir=output_dir,
+                window=args.trend_window,
+                regression_threshold=args.trend_threshold,
+            )
+            analyzer.run(model=args.model)
+        except Exception as exc:
+            logger.warning("Trend analysis failed: %s", exc)
+
     if args.no_upload:
         logger.info("Skipping upload (--no-upload)")
     else:
