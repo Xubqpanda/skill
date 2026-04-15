@@ -59,3 +59,6 @@ tasks:
   - task_gh_issue_triage
   - task_pdf_to_calendar
   - task_cve_security_triage
+  - task_csv_gdp_ranking
+  - task_csv_gdp_per_capita
+  - task_csv_gdp_regions
