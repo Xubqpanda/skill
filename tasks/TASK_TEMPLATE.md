@@ -10,6 +10,18 @@ workspace_files: []
 #     dest: input.txt
 #   - source: assets/config.json
 #     dest: config.json
+# multi_session: true  # Optional: set to true for multi-turn tasks
+# sessions:            # Optional: list of sequential user prompts
+#   - id: step_1
+#     prompt: |
+#       First prompt sent to the agent.
+#   - id: step_2
+#     prompt: |
+#       Second prompt, sent in the same conversation context.
+#   - id: fresh_start
+#     new_session: true  # Start a new session (no conversation history)
+#     prompt: |
+#       Third prompt in a fresh session — agent has no memory of prior turns.
 ---
 
 # Task Template
@@ -243,6 +255,62 @@ workspace_files:
 
 ---
 
+## Multi-Session Tasks
+
+{Optional: Define a sequence of prompts to test multi-turn conversation, iterative refinement, or cross-session memory.}
+
+**YAML Frontmatter Format:**
+
+```yaml
+multi_session: true
+sessions:
+  - id: first_turn
+    prompt: |
+      First message sent to the agent.
+  - id: follow_up
+    prompt: |
+      Follow-up message in the same conversation context.
+      The agent retains all prior conversation history.
+  - id: fresh_context
+    new_session: true
+    prompt: |
+      Message sent in a brand-new session. The agent has no
+      conversation history from prior turns, but workspace
+      files created earlier are still accessible.
+```
+
+**Fields:**
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `id` | string | Unique identifier for this session step |
+| `prompt` | string | The user message sent to the agent |
+| `new_session` | bool | If `true`, start a fresh OpenClaw session with no conversation history. Workspace files are preserved. Default: `false` |
+
+**How It Works:**
+
+1. Each session entry's `prompt` is sent to the agent in order
+2. By default, all prompts share the same conversation context (the agent remembers previous turns)
+3. When `new_session: true` is set, the agent's session is reset before sending the prompt — simulating a user returning after closing and reopening the agent
+4. The workspace directory (including any files the agent created) is **never** reset between sessions
+5. All session transcripts are merged for grading
+
+**When to Use Multi-Session:**
+
+- **Iterative refinement**: User asks the agent to create something, then asks for modifications
+- **Cross-session memory**: Test if the agent can persist and recall information across separate conversations
+- **Follow-up instructions**: Test if the agent correctly applies new constraints to prior work
+- **Realistic workflows**: Simulate a user who interacts with the agent over multiple conversations
+
+**Guidelines:**
+
+- Use `new_session: true` when you want to test the agent's ability to recover context from files (not conversation history)
+- Keep the total number of sessions reasonable (2-5) to avoid excessive timeout
+- Increase `timeout_seconds` proportionally to the number of sessions
+- Ensure the Prompt section notes that this is a multi-session task
+
+---
+
 ## Additional Notes
 
 {Optional: Any additional context, edge cases, or implementation notes for task authors or developers.}
@@ -271,3 +339,6 @@ Before submitting a new task, verify:
 - [ ] Weights in rubric sum to 100% (if applicable)
 - [ ] Timeout is reasonable for the task complexity
 - [ ] Workspace files are included in `assets/` (if needed)
+- [ ] Multi-session prompts are in the `sessions` field (if applicable)
+- [ ] `new_session: true` is set for sessions that should start fresh (if applicable)
+- [ ] `timeout_seconds` accounts for multiple sessions (if applicable)
