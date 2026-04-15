@@ -73,3 +73,6 @@ tasks:
   - task_meeting_blog_post
   - task_meeting_tldr
   - task_meeting_searchable_index
+  - task_csv_stations_by_elevation
+  - task_csv_stations_coverage
+  - task_csv_stations_filter
