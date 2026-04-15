@@ -482,7 +482,7 @@ def _ensure_judge_agent(judge_agent_prefix: str, judge_model: str, skill_dir: Pa
 
 
 def _parse_judge_response(transcript: List[Dict[str, Any]]) -> Dict[str, Any]:
-    content_chunks: List[str] = []
+    assistant_texts: List[str] = []
     for event in transcript:
         if event.get("type") != "message":
             continue
@@ -491,82 +491,50 @@ def _parse_judge_response(transcript: List[Dict[str, Any]]) -> Dict[str, Any]:
             continue
         for item in msg.get("content", []):
             if item.get("type") == "text":
-                content_chunks.append(item.get("text", ""))
-    raw_text = "\n".join(content_chunks).strip()
+                text = item.get("text", "")
+                assistant_texts.append(text)
+
+    # Transcript-based judging often includes earlier assistant echoes such as
+    # "NO_REPLY", partial waits, or prompt-embedded tool JSON. Prefer parsing
+    # the most recent assistant text chunks individually before concatenating.
+    for text in reversed(assistant_texts):
+        raw_text = text.strip()
+        if not raw_text or raw_text == "NO_REPLY":
+            continue
+        parsed = _parse_judge_text(raw_text)
+        if _looks_like_judge_payload(parsed):
+            return parsed
+
+    raw_text = "\n".join(assistant_texts).strip()
     logger.info("   [VERBOSE] Judge raw response text (first 2000 chars):\n%s", raw_text[:2000])
     if not raw_text:
         return {}
-
-    # First, try to extract JSON from code blocks (```json ... ```)
-    code_block_match = re.search(r"```json\s*(.*?)\s*```", raw_text, re.DOTALL)
-    if code_block_match:
-        try:
-            parsed = json.loads(code_block_match.group(1))
-            if isinstance(parsed, dict):
-                return parsed
-        except json.JSONDecodeError:
-            pass
-
-    # Find all potential JSON objects by looking for balanced braces
-    # We'll extract chunks that start with { and try to parse them
-    json_candidates: List[str] = []
-    brace_depth = 0
-    current_json = []
-    for char in raw_text:
-        if char == "{":
-            if brace_depth == 0:
-                current_json = []
-            brace_depth += 1
-
-        if brace_depth > 0:
-            current_json.append(char)
-
-        if char == "}":
-            brace_depth -= 1
-            if brace_depth == 0 and current_json:
-                json_candidates.append("".join(current_json))
-
-    # Try parsing from the last JSON object backwards (most recent response)
-    for candidate in reversed(json_candidates):
-        try:
-            parsed = json.loads(candidate)
-            if isinstance(parsed, dict) and "scores" in parsed:
-                # Prefer JSON that has the expected structure
-                return parsed
-        except json.JSONDecodeError:
-            continue
-
-    # Try any valid JSON dict
-    for candidate in reversed(json_candidates):
-        try:
-            parsed = json.loads(candidate)
-            if isinstance(parsed, dict):
-                return parsed
-        except json.JSONDecodeError:
-            continue
-
-    # Fallback: try to extract numeric scores from prose responses.
-    # Models sometimes return "Total: 0.72" or "Overall score: 0.65" instead of JSON.
-    score_pattern = re.search(
-        r"(?:total|overall|final)\s*(?:score)?[:\s]*(0\.\d+|1\.0+)",
-        raw_text,
-        re.IGNORECASE,
-    )
-    if score_pattern:
-        try:
-            total = float(score_pattern.group(1))
-            if 0.0 <= total <= 1.0:
-                logger.warning("Fell back to regex score extraction from prose (total=%.2f)", total)
-                return {
-                    "scores": {},
-                    "total": total,
-                    "notes": "Score extracted from prose (JSON parse failed)",
-                }
-        except ValueError:
-            pass
+    parsed = _parse_judge_text(raw_text)
+    if _looks_like_judge_payload(parsed):
+        return parsed
 
     logger.warning("Failed to parse judge JSON response")
     return {}
+
+
+def _looks_like_judge_payload(parsed: Dict[str, Any]) -> bool:
+    if not isinstance(parsed, dict) or not parsed:
+        return False
+    judge_keys = {
+        "scores",
+        "criteria_scores",
+        "criterion_scores",
+        "total",
+        "score",
+        "overall_score",
+        "total_score",
+        "completionScore",
+        "notes",
+        "justification",
+        "reasoning",
+        "overall",
+    }
+    return any(key in parsed for key in judge_keys)
 
 
 def _coerce_score_value(value: Any) -> float | None:

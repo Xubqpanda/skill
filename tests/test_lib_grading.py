@@ -10,7 +10,12 @@ SCRIPTS_DIR = ROOT / "scripts"
 if str(SCRIPTS_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPTS_DIR))
 
-from lib_grading import _combine_grades, _normalize_judge_response, GradeResult  # noqa: E402
+from lib_grading import (  # noqa: E402
+    _combine_grades,
+    _normalize_judge_response,
+    _parse_judge_response,
+    GradeResult,
+)
 
 
 class JudgeNormalizationTests(unittest.TestCase):
@@ -58,6 +63,88 @@ class JudgeNormalizationTests(unittest.TestCase):
         combined = _combine_grades(_Task(), auto, judge)
 
         self.assertAlmostEqual(combined.score, 0.8045174825174824)
+
+    def test_parse_judge_response_prefers_latest_assistant_json_over_embedded_tool_json(
+        self,
+    ) -> None:
+        transcript = [
+            {
+                "type": "message",
+                "message": {
+                    "role": "assistant",
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": (
+                                'Tool: web_search({"count": 10, "query": "WWDC 2025"})\n'
+                                'Result: {"query": "WWDC 2025", "count": 10}'
+                            ),
+                        }
+                    ],
+                },
+            },
+            {
+                "type": "message",
+                "message": {
+                    "role": "assistant",
+                    "content": [{"type": "text", "text": "NO_REPLY"}],
+                },
+            },
+            {
+                "type": "message",
+                "message": {
+                    "role": "assistant",
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": (
+                                '{"scores": {"accuracy": 0.75, "completeness": 1.0}, '
+                                '"total": 0.875, "notes": "Final judgment"}'
+                            ),
+                        }
+                    ],
+                },
+            },
+        ]
+
+        parsed = _parse_judge_response(transcript)
+
+        self.assertEqual(parsed["scores"]["accuracy"], 0.75)
+        self.assertEqual(parsed["scores"]["completeness"], 1.0)
+        self.assertEqual(parsed["total"], 0.875)
+
+    def test_parse_judge_response_ignores_waiting_messages_before_final_json(self) -> None:
+        transcript = [
+            {
+                "type": "message",
+                "message": {
+                    "role": "assistant",
+                    "content": [
+                        {"type": "text", "text": "Waiting for remaining parts (6-7)."}
+                    ],
+                },
+            },
+            {
+                "type": "message",
+                "message": {
+                    "role": "assistant",
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": (
+                                '{"scores": {"clarity": 0.75, "accuracy": 0.85}, '
+                                '"total": 0.8, "notes": "Looks good"}'
+                            ),
+                        }
+                    ],
+                },
+            },
+        ]
+
+        parsed = _parse_judge_response(transcript)
+
+        self.assertEqual(parsed["scores"]["clarity"], 0.75)
+        self.assertEqual(parsed["total"], 0.8)
 
 
 if __name__ == "__main__":
