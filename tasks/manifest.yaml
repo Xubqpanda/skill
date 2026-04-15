@@ -59,6 +59,9 @@ tasks:
   - task_gh_issue_triage
   - task_pdf_to_calendar
   - task_cve_security_triage
+  - task_csv_temp_anomalies
+  - task_csv_temp_trend
+  - task_csv_temp_decades
   - task_csv_life_exp_ranking
   - task_csv_life_exp_outliers
   - task_csv_life_exp_change
