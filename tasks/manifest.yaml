@@ -99,3 +99,6 @@ tasks:
   - task_log_apache_critical
   - task_log_apache_timeline
   - task_log_syslog_boot
+  - task_csv_iris_summary
+  - task_csv_iris_classify
+  - task_csv_iris_outliers
