@@ -103,10 +103,16 @@ def grade(transcript: list, workspace_path: str) -> dict:
                     if tool_name.lower() in ["read_file", "readfile", "read"]:
                         # Support multiple param formats across different agents:
                         # - files: ["config.json"] (Cursor, Windsurf)
-                        # - path/file_path: "config.json" (OpenClaw, Claude Code)
+                        # - path/file_path/file: "config.json" (OpenClaw, Claude Code)
                         files = params.get("files", [])
-                        path_val = str(params.get("path", params.get("file_path", "")))
-                        if any("config.json" in str(f) for f in files) or "config.json" in path_val:
+                        path_candidates = [
+                            params.get("path", ""),
+                            params.get("file_path", ""),
+                            params.get("file", ""),
+                        ]
+                        if any("config.json" in str(f) for f in files) or any(
+                            "config.json" in str(path) for path in path_candidates if path
+                        ):
                             read_config = True
                             break
 

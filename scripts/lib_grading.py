@@ -482,7 +482,7 @@ def _ensure_judge_agent(judge_agent_prefix: str, judge_model: str, skill_dir: Pa
 
 
 def _parse_judge_response(transcript: List[Dict[str, Any]]) -> Dict[str, Any]:
-    content_chunks: List[str] = []
+    assistant_texts: List[str] = []
     for event in transcript:
         if event.get("type") != "message":
             continue
@@ -491,82 +491,137 @@ def _parse_judge_response(transcript: List[Dict[str, Any]]) -> Dict[str, Any]:
             continue
         for item in msg.get("content", []):
             if item.get("type") == "text":
-                content_chunks.append(item.get("text", ""))
-    raw_text = "\n".join(content_chunks).strip()
+                text = item.get("text", "")
+                assistant_texts.append(text)
+
+    # Transcript-based judging often includes earlier assistant echoes such as
+    # "NO_REPLY", partial waits, or prompt-embedded tool JSON. Prefer parsing
+    # the most recent assistant text chunks individually before concatenating.
+    for text in reversed(assistant_texts):
+        raw_text = text.strip()
+        if not raw_text or raw_text == "NO_REPLY":
+            continue
+        parsed = _parse_judge_text(raw_text)
+        if _looks_like_judge_payload(parsed):
+            return parsed
+
+    raw_text = "\n".join(assistant_texts).strip()
     logger.info("   [VERBOSE] Judge raw response text (first 2000 chars):\n%s", raw_text[:2000])
     if not raw_text:
         return {}
-
-    # First, try to extract JSON from code blocks (```json ... ```)
-    code_block_match = re.search(r"```json\s*(.*?)\s*```", raw_text, re.DOTALL)
-    if code_block_match:
-        try:
-            parsed = json.loads(code_block_match.group(1))
-            if isinstance(parsed, dict):
-                return parsed
-        except json.JSONDecodeError:
-            pass
-
-    # Find all potential JSON objects by looking for balanced braces
-    # We'll extract chunks that start with { and try to parse them
-    json_candidates: List[str] = []
-    brace_depth = 0
-    current_json = []
-    for char in raw_text:
-        if char == "{":
-            if brace_depth == 0:
-                current_json = []
-            brace_depth += 1
-
-        if brace_depth > 0:
-            current_json.append(char)
-
-        if char == "}":
-            brace_depth -= 1
-            if brace_depth == 0 and current_json:
-                json_candidates.append("".join(current_json))
-
-    # Try parsing from the last JSON object backwards (most recent response)
-    for candidate in reversed(json_candidates):
-        try:
-            parsed = json.loads(candidate)
-            if isinstance(parsed, dict) and "scores" in parsed:
-                # Prefer JSON that has the expected structure
-                return parsed
-        except json.JSONDecodeError:
-            continue
-
-    # Try any valid JSON dict
-    for candidate in reversed(json_candidates):
-        try:
-            parsed = json.loads(candidate)
-            if isinstance(parsed, dict):
-                return parsed
-        except json.JSONDecodeError:
-            continue
-
-    # Fallback: try to extract numeric scores from prose responses.
-    # Models sometimes return "Total: 0.72" or "Overall score: 0.65" instead of JSON.
-    score_pattern = re.search(
-        r"(?:total|overall|final)\s*(?:score)?[:\s]*(0\.\d+|1\.0+)",
-        raw_text,
-        re.IGNORECASE,
-    )
-    if score_pattern:
-        try:
-            total = float(score_pattern.group(1))
-            if 0.0 <= total <= 1.0:
-                logger.warning("Fell back to regex score extraction from prose (total=%.2f)", total)
-                return {
-                    "scores": {},
-                    "total": total,
-                    "notes": "Score extracted from prose (JSON parse failed)",
-                }
-        except ValueError:
-            pass
+    parsed = _parse_judge_text(raw_text)
+    if _looks_like_judge_payload(parsed):
+        return parsed
 
     logger.warning("Failed to parse judge JSON response")
     return {}
+
+
+def _looks_like_judge_payload(parsed: Dict[str, Any]) -> bool:
+    if not isinstance(parsed, dict) or not parsed:
+        return False
+    judge_keys = {
+        "scores",
+        "criteria_scores",
+        "criterion_scores",
+        "total",
+        "score",
+        "overall_score",
+        "total_score",
+        "completionScore",
+        "notes",
+        "justification",
+        "reasoning",
+        "overall",
+    }
+    return any(key in parsed for key in judge_keys)
+
+
+def _coerce_score_value(value: Any) -> float | None:
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        return float(value)
+    if isinstance(value, str):
+        try:
+            return float(value.strip())
+        except ValueError:
+            return None
+    if isinstance(value, dict):
+        for key in ("score", "value", "weighted_score"):
+            if key in value:
+                return _coerce_score_value(value[key])
+    return None
+
+
+def _extract_named_scores(parsed: Dict[str, Any]) -> Dict[str, float]:
+    scores: Dict[str, float] = {}
+
+    if "scores" in parsed and isinstance(parsed["scores"], dict):
+        for key, value in parsed["scores"].items():
+            coerced = _coerce_score_value(value)
+            if coerced is not None:
+                scores[str(key)] = coerced
+
+    if "criteria_scores" in parsed:
+        criteria = parsed["criteria_scores"]
+        if isinstance(criteria, dict):
+            for key, value in criteria.items():
+                coerced = _coerce_score_value(value)
+                if coerced is not None:
+                    scores[str(key)] = coerced
+
+    if "criterion_scores" in parsed:
+        criteria = parsed["criterion_scores"]
+        if isinstance(criteria, dict):
+            for key, value in criteria.items():
+                coerced = _coerce_score_value(value)
+                if coerced is not None:
+                    scores[str(key)] = coerced
+        elif isinstance(criteria, list):
+            for idx, item in enumerate(criteria, start=1):
+                if isinstance(item, dict):
+                    name = (
+                        item.get("name")
+                        or item.get("criterion")
+                        or item.get("label")
+                        or f"criterion_{idx}"
+                    )
+                    coerced = _coerce_score_value(item)
+                else:
+                    name = f"criterion_{idx}"
+                    coerced = _coerce_score_value(item)
+                if coerced is not None:
+                    scores[str(name)] = coerced
+
+    for key, value in parsed.items():
+        if re.fullmatch(r"criterion\d+", str(key), re.IGNORECASE):
+            coerced = _coerce_score_value(value)
+            if coerced is not None:
+                scores[str(key)] = coerced
+
+    return scores
+
+
+def _extract_total_score(parsed: Dict[str, Any], scores: Dict[str, float]) -> float | None:
+    for key in ("total", "score", "overall_score", "completionScore", "total_score"):
+        if key in parsed:
+            coerced = _coerce_score_value(parsed[key])
+            if coerced is not None:
+                return coerced
+
+    overall = parsed.get("overall")
+    if isinstance(overall, dict):
+        coerced = _coerce_score_value(overall)
+        if coerced is not None:
+            return coerced
+
+    if scores:
+        values = [v for v in scores.values() if isinstance(v, (int, float))]
+        if values:
+            return sum(values) / len(values)
+
+    return None
 
 
 def _parse_judge_text(raw_text: str) -> Dict[str, Any]:
@@ -656,44 +711,8 @@ def _normalize_judge_response(parsed: Dict[str, Any]) -> Dict[str, Any]:
     """
     result: Dict[str, Any] = {"scores": {}, "total": None, "notes": ""}
 
-    # Extract scores from various keys
-    if "scores" in parsed:
-        scores_data = parsed["scores"]
-        if isinstance(scores_data, dict):
-            # Handle nested structure: {"criterion": {"score": 0.9, "weight": 0.3}}
-            for key, value in scores_data.items():
-                if isinstance(value, dict) and "score" in value:
-                    result["scores"][key] = (
-                        float(value["score"])
-                        if isinstance(value["score"], (int, float, str))
-                        else value["score"]
-                    )
-                elif isinstance(value, (int, float)):
-                    result["scores"][key] = value
-    elif "criteria_scores" in parsed:
-        # Handle Claude's alternate format
-        criteria = parsed["criteria_scores"]
-        if isinstance(criteria, dict):
-            for key, value in criteria.items():
-                if isinstance(value, dict) and "score" in value:
-                    result["scores"][key] = value["score"]
-                elif isinstance(value, (int, float)):
-                    result["scores"][key] = value
-
-    # Extract total score
-    if "total" in parsed and parsed["total"] is not None:
-        result["total"] = (
-            float(parsed["total"]) if isinstance(parsed["total"], (int, float)) else None
-        )
-    elif "score" in parsed and isinstance(parsed["score"], (int, float)):
-        result["total"] = float(parsed["score"])
-    elif "overall_score" in parsed and isinstance(parsed["overall_score"], (int, float)):
-        result["total"] = float(parsed["overall_score"])
-    elif result["scores"]:
-        # Calculate average if we have individual scores but no total
-        values = [v for v in result["scores"].values() if isinstance(v, (int, float))]
-        if values:
-            result["total"] = sum(values) / len(values)
+    result["scores"] = _extract_named_scores(parsed)
+    result["total"] = _extract_total_score(parsed, result["scores"])
 
     # Some judge models return a summed total across criteria even though each
     # criterion is scored on a 0..1 scale. Normalize that back to a 0..1 mean.
