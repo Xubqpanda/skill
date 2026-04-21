@@ -79,6 +79,11 @@ tasks:
   - task_meeting_tech_competitors
   - task_meeting_tech_messaging
   - task_meeting_tech_product_features
+  - task_meeting_advisory_attendees
+  - task_meeting_advisory_stakeholders
+  - task_meeting_advisory_technical
+  - task_meeting_advisory_timeline
+  - task_meeting_advisory_acronyms
   - task_meeting_executive_summary
   - task_meeting_sentiment_analysis
   - task_meeting_follow_up_email
