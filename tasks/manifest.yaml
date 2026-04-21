@@ -98,3 +98,4 @@ tasks:
   - task_log_apache_error_summary
   - task_log_apache_critical
   - task_log_apache_timeline
+  - task_log_syslog_boot
