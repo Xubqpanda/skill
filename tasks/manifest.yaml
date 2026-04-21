@@ -112,3 +112,15 @@ tasks:
   - task_meeting_gov_data_sources
   - task_meeting_gov_controversy
   - task_meeting_gov_next_steps
+  - task_codebase_navigation
+  - task_deep_research
+  - task_competitive_research
+  - task_oss_alternative_research
+  - task_video_transcript_extraction
+  - task_browser_automation
+  - task_pricing_research
+  - task_it_procurement
+  - task_eu_regulation_research
+  - task_byok_best_practices
+  - task_cron_organizer
+  - task_subway_navigation
