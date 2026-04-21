@@ -106,3 +106,9 @@ tasks:
   - task_csv_cities_filter
   - task_csv_cities_density
   - task_csv_cities_growth
+  - task_meeting_gov_speaker_summary
+  - task_meeting_gov_qa_extract
+  - task_meeting_gov_recommendations
+  - task_meeting_gov_data_sources
+  - task_meeting_gov_controversy
+  - task_meeting_gov_next_steps
