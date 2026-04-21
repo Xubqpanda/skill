@@ -727,6 +727,34 @@ def _extract_usage_from_transcript(transcript: List[Dict[str, Any]]) -> Dict[str
     return totals
 
 
+def _archive_transcript(
+    *,
+    agent_id: str,
+    current_session_id: str,
+    start_time: float,
+    output_dir: Optional[Path],
+    task_id: str,
+    session_index: int,
+) -> None:
+    """Archive the transcript for a session before starting a new one.
+
+    In multi-session tasks with ``new_session: true``, we need to save each
+    session's transcript separately before cleaning up the agent's session
+    state.  This ensures the grading engine can inspect the full conversation
+    history across all sessions.
+    """
+    transcript, transcript_path = _load_transcript(agent_id, current_session_id, start_time)
+    if transcript_path and output_dir:
+        import shutil as _shutil
+        output_dir.mkdir(parents=True, exist_ok=True)
+        archive_dest = output_dir / f"{task_id}_session{session_index}.jsonl"
+        try:
+            _shutil.copy2(transcript_path, archive_dest)
+            logger.info("Archived session %d transcript to %s", session_index, archive_dest)
+        except OSError as exc:
+            logger.warning("Failed to archive session transcript: %s", exc)
+
+
 def execute_openclaw_task(
     *,
     task: Task,
@@ -773,19 +801,42 @@ def execute_openclaw_task(
     # Check if this is a multi-session task
     sessions = task.frontmatter.get("sessions", [])
     if sessions:
-        # Multi-session task: send each prompt in sequence
+        # Multi-session task: send each prompt in sequence.
+        # When a session entry has `new_session: true`, we start a fresh
+        # OpenClaw session so the agent has no conversation history from
+        # prior sessions — simulating a user returning after closing the
+        # agent.  The workspace (and any files created) are preserved.
         logger.info("📋 Multi-session task with %d sessions", len(sessions))
+        current_session_id = session_id
         for i, session_entry in enumerate(sessions, 1):
             # Extract prompt text from session entry (handle both string and dict formats)
+            is_new_session = False
             if isinstance(session_entry, str):
                 session_prompt = session_entry
             elif isinstance(session_entry, dict):
                 session_prompt = session_entry.get("prompt") or session_entry.get("message", "")
+                is_new_session = bool(session_entry.get("new_session", False))
             else:
                 logger.warning("⚠️ Skipping invalid session entry: %s", session_entry)
                 continue
 
-            logger.info("   Session %d/%d", i, len(sessions))
+            if is_new_session:
+                # Archive the current transcript before starting a new session
+                # so we don't lose the conversation history from prior sessions.
+                _archive_transcript(
+                    agent_id=agent_id,
+                    current_session_id=current_session_id,
+                    start_time=start_time,
+                    output_dir=output_dir,
+                    task_id=task.task_id,
+                    session_index=i - 1,
+                )
+                # Clean up old session state so the agent starts with a blank slate
+                cleanup_agent_sessions(agent_id)
+                current_session_id = f"{task.task_id}_s{i}_{int(time.time() * 1000)}"
+                logger.info("   🔄 Starting new session (session_id=%s)", current_session_id)
+
+            logger.info("   Session %d/%d (new_session=%s)", i, len(sessions), is_new_session)
             elapsed = time.time() - start_time
             remaining = timeout_seconds - elapsed
             if remaining <= 0:
@@ -798,7 +849,7 @@ def execute_openclaw_task(
                         "--agent",
                         agent_id,
                         "--session-id",
-                        session_id,
+                        current_session_id,
                         "--message",
                         session_prompt,
                     ]
@@ -860,7 +911,42 @@ def execute_openclaw_task(
         except FileNotFoundError as exc:
             stderr = f"openclaw command not found: {exc}"
 
-    transcript, transcript_path = _load_transcript(agent_id, session_id, start_time)
+    # For multi-session tasks that used new_session, the final transcript only
+    # contains the last session's conversation.  Merge archived session
+    # transcripts (from _archive_transcript) so the grading engine sees the
+    # full history across all sessions.
+    has_new_session = sessions and any(
+        isinstance(s, dict) and s.get("new_session") for s in sessions
+    )
+    if has_new_session:
+        final_transcript, transcript_path = _load_transcript(
+            agent_id, current_session_id, start_time
+        )
+        # Load archived session transcripts and merge them in order
+        merged_transcript: List[Dict[str, Any]] = []
+        if output_dir:
+            for session_idx in range(len(sessions)):
+                archive_path = output_dir / f"{task.task_id}_session{session_idx}.jsonl"
+                if archive_path.exists():
+                    try:
+                        for line in archive_path.read_text(encoding="utf-8").splitlines():
+                            if not line.strip():
+                                continue
+                            try:
+                                merged_transcript.append(json.loads(line))
+                            except json.JSONDecodeError:
+                                pass
+                        # Clean up per-session archive after merging
+                        try:
+                            archive_path.unlink()
+                        except OSError:
+                            pass
+                    except OSError as exc:
+                        logger.warning("Failed to read archived session transcript: %s", exc)
+        merged_transcript.extend(final_transcript)
+        transcript = merged_transcript
+    else:
+        transcript, transcript_path = _load_transcript(agent_id, session_id, start_time)
     usage = _extract_usage_from_transcript(transcript)
     execution_time = time.time() - start_time
 

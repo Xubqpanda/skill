@@ -59,6 +59,7 @@ categories:
     - task_codebase_navigation
     - task_browser_automation
     - task_video_transcript_extraction
+    - task_iterative_code_refine
 
   analysis:
     - task_summary
@@ -72,6 +73,7 @@ categories:
     - task_contract_analysis
     - task_image_identification
     - task_cve_security_triage
+    - task_session_chain_analysis
 
   csv_analysis:
     - task_csv_stock_trend
