@@ -102,3 +102,7 @@ tasks:
   - task_csv_iris_summary
   - task_csv_iris_classify
   - task_csv_iris_outliers
+  - task_csv_cities_ranking
+  - task_csv_cities_filter
+  - task_csv_cities_density
+  - task_csv_cities_growth
