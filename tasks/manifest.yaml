@@ -65,3 +65,26 @@ tasks:
   - task_meeting_council_upcoming
   - task_meeting_council_contact_info
   - task_meeting_council_neighborhood
+  - task_csv_temp_anomalies
+  - task_csv_temp_trend
+  - task_csv_temp_decades
+  - task_csv_life_exp_ranking
+  - task_csv_life_exp_outliers
+  - task_csv_life_exp_change
+  - task_csv_gdp_ranking
+  - task_csv_gdp_per_capita
+  - task_csv_gdp_regions
+  - task_meeting_tech_action_items
+  - task_meeting_tech_decisions
+  - task_meeting_tech_competitors
+  - task_meeting_tech_messaging
+  - task_meeting_tech_product_features
+  - task_meeting_executive_summary
+  - task_meeting_sentiment_analysis
+  - task_meeting_follow_up_email
+  - task_meeting_blog_post
+  - task_meeting_tldr
+  - task_meeting_searchable_index
+  - task_csv_stations_by_elevation
+  - task_csv_stations_coverage
+  - task_csv_stations_filter
