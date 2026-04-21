@@ -59,6 +59,12 @@ tasks:
   - task_gh_issue_triage
   - task_pdf_to_calendar
   - task_cve_security_triage
+  - task_meeting_council_votes
+  - task_meeting_council_public_comment
+  - task_meeting_council_budget
+  - task_meeting_council_upcoming
+  - task_meeting_council_contact_info
+  - task_meeting_council_neighborhood
   - task_csv_temp_anomalies
   - task_csv_temp_trend
   - task_csv_temp_decades
