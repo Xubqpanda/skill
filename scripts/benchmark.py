@@ -181,7 +181,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--suite",
         default="all",
-        help='Tasks to run: "all", "automated-only", or comma-separated IDs',
+        help='Tasks to run: "all", "automated-only", a category name (e.g. "coding"), or comma-separated task IDs',
     )
     parser.add_argument(
         "--output-dir",
@@ -279,11 +279,28 @@ def _parse_args() -> argparse.Namespace:
     return args
 
 
-def _select_task_ids(tasks: List[Task], suite: str) -> Optional[List[str]]:
+def _select_task_ids(
+    tasks: List[Task],
+    suite: str,
+    category_map: Optional[Dict[str, str]] = None,
+) -> Optional[List[str]]:
     if suite == "all":
         return None
     if suite == "automated-only":
         return [task.task_id for task in tasks if task.grading_type == "automated"]
+
+    # Check if suite matches a manifest category name
+    if category_map:
+        available_categories = set(category_map.values())
+        # Support "+" syntax for combining categories: "coding+research"
+        requested = [s.strip() for s in suite.split("+")]
+        if all(r in available_categories for r in requested):
+            requested_set = set(requested)
+            return [
+                task.task_id for task in tasks if category_map.get(task.task_id) in requested_set
+            ]
+
+    # Fall back to comma-separated task IDs
     return [task_id.strip() for task_id in suite.split(",") if task_id.strip()]
 
 
@@ -518,13 +535,21 @@ def _log_efficiency_summary(
     logger.info("%s", "=" * 80)
 
 
-def _log_category_summary(
+def _compute_category_scores(
     task_entries: List[Dict[str, Any]],
     tasks_by_id: Dict[str, Any],
-) -> None:
-    """Log a summary grouped by category, matching the PinchBench website format."""
-    # Group scores by category
-    category_scores: Dict[str, Dict[str, float]] = {}
+    category_order: Optional[List[str]] = None,
+) -> Dict[str, Dict[str, Any]]:
+    """Compute per-category score rollups from task results.
+
+    Returns a dict mapping category name to a dict with keys:
+    ``score``, ``max_score``, ``pct``, ``task_count``.
+
+    If *category_order* is provided it is used only for ordering the returned
+    dict (Python 3.7+ preserves insertion order).  Categories not in the order
+    list are appended alphabetically.
+    """
+    raw: Dict[str, Dict[str, float]] = {}
 
     for entry in task_entries:
         task_id = entry["task_id"]
@@ -537,16 +562,50 @@ def _log_category_summary(
         mean_score = float(grading.get("mean", 0.0))
         max_score = 1.0  # Each task is scored 0-1
 
-        if category not in category_scores:
-            category_scores[category] = {"earned": 0.0, "possible": 0.0, "task_count": 0}
+        if category not in raw:
+            raw[category] = {"score": 0.0, "max_score": 0.0, "task_count": 0}
 
-        category_scores[category]["earned"] += mean_score
-        category_scores[category]["possible"] += max_score
-        category_scores[category]["task_count"] += 1
+        raw[category]["score"] += mean_score
+        raw[category]["max_score"] += max_score
+        raw[category]["task_count"] += 1
+
+    # Determine display order
+    if category_order:
+        ordered_keys = [c.upper() for c in category_order if c.upper() in raw]
+        remaining = sorted(k for k in raw if k not in ordered_keys)
+        ordered_keys.extend(remaining)
+    else:
+        ordered_keys = sorted(raw.keys())
+
+    result: Dict[str, Dict[str, Any]] = {}
+    for cat in ordered_keys:
+        data = raw[cat]
+        pct = (data["score"] / data["max_score"] * 100) if data["max_score"] > 0 else 0
+        result[cat] = {
+            "score": round(data["score"], 6),
+            "max_score": round(data["max_score"], 6),
+            "pct": round(pct, 1),
+            "task_count": int(data["task_count"]),
+        }
+
+    return result
+
+
+def _log_category_summary(
+    task_entries: List[Dict[str, Any]],
+    tasks_by_id: Dict[str, Any],
+    category_order: Optional[List[str]] = None,
+) -> Dict[str, Dict[str, Any]]:
+    """Log a summary grouped by category, matching the PinchBench website format.
+
+    Returns the computed category_scores dict so callers can embed it in
+    results JSON.
+    """
+    category_scores = _compute_category_scores(task_entries, tasks_by_id, category_order)
 
     # Calculate overall totals
-    total_earned = sum(c["earned"] for c in category_scores.values())
-    total_possible = sum(c["possible"] for c in category_scores.values())
+    total_earned = sum(c["score"] for c in category_scores.values())
+    total_possible = sum(c["max_score"] for c in category_scores.values())
     overall_pct = (total_earned / total_possible * 100) if total_possible > 0 else 0
 
     logger.info("\n%s", "=" * 80)
@@ -558,11 +617,9 @@ def _log_category_summary(
     logger.info("   %-20s %8s %12s", "CATEGORY", "SCORE", "TASKS")
     logger.info("   %s", "-" * 44)
 
-    # Sort categories alphabetically for consistent output
-    for category in sorted(category_scores.keys()):
-        data = category_scores[category]
-        pct = (data["earned"] / data["possible"] * 100) if data["possible"] > 0 else 0
-        task_count = int(data["task_count"])
+    for category, data in category_scores.items():
+        pct = data["pct"]
+        task_count = data["task_count"]
         task_label = "task" if task_count == 1 else "tasks"
 
         # Color indicator based on score
@@ -584,6 +641,8 @@ def _log_category_summary(
 
     logger.info("   %s", "-" * 44)
     logger.info("%s", "=" * 80)
+
+    return category_scores
 
 
 def main():
@@ -678,7 +737,7 @@ def main():
     )
     cleanup_agent_sessions(agent_id)
 
-    task_ids = _select_task_ids(runner.tasks, args.suite)
+    task_ids = _select_task_ids(runner.tasks, args.suite, runner.task_loader.category_map)
     results = []
     grades_by_task_id = {}
     sanity_task_id = "task_sanity"
@@ -696,22 +755,31 @@ def main():
     incremental_dir.mkdir(parents=True, exist_ok=True)
     incremental_path = incremental_dir / f"{run_id}_{model_slug}.json"
 
+    category_map = runner.task_loader.category_map
+    category_order = runner.task_loader.categories
+
+    def _build_task_entry(r: Dict[str, Any]) -> Dict[str, Any]:
+        """Build a single task entry dict for results JSON."""
+        tid = r["task_id"]
+        entry: Dict[str, Any] = {
+            "task_id": tid,
+            "status": r["status"],
+            "timed_out": r["timed_out"],
+            "execution_time": r["execution_time"],
+            "transcript_length": len(r["transcript"]),
+            "usage": r.get("usage", {}),
+            "workspace": r["workspace"],
+            "grading": grades_by_task_id.get(tid, {}),
+            "frontmatter": tasks_by_id[tid].frontmatter,
+        }
+        if category_map:
+            entry["category"] = category_map.get(tid, "")
+        return entry
+
     def _write_incremental_results():
-        task_entries = [
-            {
-                "task_id": r["task_id"],
-                "status": r["status"],
-                "timed_out": r["timed_out"],
-                "execution_time": r["execution_time"],
-                "transcript_length": len(r["transcript"]),
-                "usage": r.get("usage", {}),
-                "workspace": r["workspace"],
-                "grading": grades_by_task_id.get(r["task_id"], {}),
-                "frontmatter": tasks_by_id[r["task_id"]].frontmatter,
-            }
-            for r in results
-        ]
+        task_entries = [_build_task_entry(r) for r in results]
         efficiency = _compute_efficiency_summary(task_entries, grades_by_task_id)
+        cat_scores = _compute_category_scores(task_entries, tasks_by_id, category_order)
         partial = {
             "model": args.model,
             "benchmark_version": _get_benchmark_version(skill_root),
@@ -720,6 +788,7 @@ def main():
             "suite": args.suite,
             "runs_per_task": runs_per_task,
             "tasks": task_entries,
+            "category_scores": cat_scores,
             "efficiency": efficiency,
             "in_progress": True,
             "completed_tasks": len(grades_by_task_id),
@@ -853,21 +922,9 @@ def main():
 
     def _build_and_write_results():
         """Build aggregate result from completed tasks and write to output_path."""
-        task_entries = [
-            {
-                "task_id": result["task_id"],
-                "status": result["status"],
-                "timed_out": result["timed_out"],
-                "execution_time": result["execution_time"],
-                "transcript_length": len(result["transcript"]),
-                "usage": result.get("usage", {}),
-                "workspace": result["workspace"],
-                "grading": grades_by_task_id[result["task_id"]],
-                "frontmatter": tasks_by_id[result["task_id"]].frontmatter,
-            }
-            for result in results
-        ]
+        task_entries = [_build_task_entry(r) for r in results]
         efficiency = _compute_efficiency_summary(task_entries, grades_by_task_id)
+        cat_scores = _compute_category_scores(task_entries, tasks_by_id, category_order)
         aggregate = {
             "model": args.model,
             "benchmark_version": _get_benchmark_version(skill_root),
@@ -876,6 +933,7 @@ def main():
             "suite": args.suite,
             "runs_per_task": runs_per_task,
             "tasks": task_entries,
+            "category_scores": cat_scores,
             "efficiency": efficiency,
         }
         output_path.write_text(json.dumps(aggregate, indent=2), encoding="utf-8")
@@ -890,7 +948,7 @@ def main():
     logger.info("📊 Final score: %.2f/%.0f (%.1f%%)", total_score, max_score, score_pct)
 
     logger.info("Saved results to %s", output_path)
-    _log_category_summary(task_entries, tasks_by_id)
+    _log_category_summary(task_entries, tasks_by_id, category_order)
     _log_efficiency_summary(efficiency, grades_by_task_id)
     # Run trend analysis if requested
     if args.trend:

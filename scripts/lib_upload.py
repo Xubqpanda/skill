@@ -233,25 +233,27 @@ def _build_payload(results_path: Path) -> Dict[str, Any]:
         if notes is None:
             notes = ""
 
-        formatted_tasks.append(
-            {
-                "task_id": task.get("task_id"),
-                "score": score,
-                "max_score": max_for_task,
-                "grading_type": grading_type,
-                "timed_out": bool(task.get("timed_out")),
-                "execution_time_seconds": task.get("execution_time"),
-                "breakdown": breakdown,
-                "notes": notes,
-                "frontmatter": task.get("frontmatter", {}),
-            }
-        )
+        task_entry: dict[str, Any] = {
+            "task_id": task.get("task_id"),
+            "score": score,
+            "max_score": max_for_task,
+            "grading_type": grading_type,
+            "timed_out": bool(task.get("timed_out")),
+            "execution_time_seconds": task.get("execution_time"),
+            "breakdown": breakdown,
+            "notes": notes,
+            "frontmatter": task.get("frontmatter", {}),
+        }
+        # Include manifest-derived category as a first-class field
+        if "category" in task:
+            task_entry["category"] = task["category"]
+        formatted_tasks.append(task_entry)
 
     client_version = _read_client_version()
     model = raw.get("model", "")
     provider = model.split("/")[0] if "/" in model else ""
 
-    payload = {
+    payload: dict[str, Any] = {
         "submission_id": str(uuid.uuid4()),
         "timestamp": _format_timestamp(raw.get("timestamp")),
         "client_version": client_version,
@@ -271,6 +273,9 @@ def _build_payload(results_path: Path) -> Dict[str, Any]:
             "system": collect_system_metadata(),
         },
     }
+    # Include category score rollups if present in results
+    if "category_scores" in raw:
+        payload["category_scores"] = raw["category_scores"]
     return payload
 
 
