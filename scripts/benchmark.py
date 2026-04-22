@@ -22,6 +22,7 @@ import statistics
 import subprocess
 import sys
 import time
+from concurrent.futures import Future, ThreadPoolExecutor
 from pathlib import Path
 from typing import Dict, List, Optional, Any
 
@@ -33,7 +34,7 @@ from lib_agent import (
     slugify_model,
     validate_openrouter_model,
 )
-from lib_grading import GradeResult, grade_task
+from lib_grading import DEFAULT_JUDGE_TIMEOUT_SECONDS, GradeResult, grade_task
 from lib_tasks import Task, TaskLoader
 
 
@@ -251,6 +252,11 @@ def _parse_args() -> argparse.Namespace:
         "--no-fail-fast",
         action="store_true",
         help="Continue running all tasks even if sanity check scores 0%%",
+    )
+    parser.add_argument(
+        "--no-parallel-judge",
+        action="store_true",
+        help="Disable parallel judge execution (grade synchronously after each task)",
     )
     parser.add_argument(
         "--trend",
@@ -800,7 +806,70 @@ def main():
         except OSError:
             pass
 
+    # Parallel judge execution: grade previous task while current task runs
+    use_parallel_judge = not args.no_parallel_judge
+    judge_executor: Optional[ThreadPoolExecutor] = None
+    pending_grade_future: Optional[Future] = None
+    pending_grade_task: Optional[Task] = None
+    pending_grade_result: Optional[Dict[str, Any]] = None
+
+    if use_parallel_judge:
+        judge_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="judge")
+        logger.info("Parallel judge execution enabled")
+
+    def _wait_for_pending_grade() -> None:
+        """Wait for any pending background grade to complete and record it."""
+        nonlocal pending_grade_future, pending_grade_task, pending_grade_result
+        if pending_grade_future is None:
+            return
+
+        try:
+            grade = pending_grade_future.result(timeout=DEFAULT_JUDGE_TIMEOUT_SECONDS)
+        except Exception as exc:
+            logger.warning("Background grading failed for %s: %s", pending_grade_task.task_id, exc)
+            grade = GradeResult(
+                task_id=pending_grade_task.task_id,
+                score=0.0,
+                max_score=1.0,
+                grading_type=pending_grade_task.grading_type,
+                breakdown={},
+                notes=f"Background grading failed: {exc}",
+            )
+
+        # Log the grade
+        score_pct = grade.score / grade.max_score * 100 if grade.max_score > 0 else 0
+        status_emoji = "✅" if grade.score >= grade.max_score else "⚠️" if grade.score > 0 else "❌"
+        logger.info(
+            "%s Task %s: %.1f/%.1f (%.0f%%) - %s [background]",
+            status_emoji,
+            pending_grade_task.task_id,
+            grade.score,
+            grade.max_score,
+            score_pct,
+            grade.grading_type,
+        )
+        if grade.notes:
+            logger.info("   Notes: %s", grade.notes[:200])
+
+        # Record the grade
+        task_scores = [grade.score]
+        grades_by_task_id[pending_grade_task.task_id] = {
+            "runs": [grade.to_dict()],
+            "mean": statistics.mean(task_scores),
+            "std": 0.0,
+            "min": min(task_scores),
+            "max": max(task_scores),
+        }
+
+        pending_grade_future = None
+        pending_grade_task = None
+        pending_grade_result = None
+
     for i, task in enumerate(tasks_to_run, 1):
+        # Wait for previous task's background grade before starting new task
+        # (we need to record its results before they get overwritten)
+        _wait_for_pending_grade()
+
         task_grades = []
         task_results = []
         for run_index in range(runs_per_task):
@@ -841,48 +910,77 @@ def main():
                     "stdout": "",
                     "stderr": execution_error,
                 }
-            try:
-                grade_kwargs = dict(
-                    task=task, execution_result=result, skill_dir=skill_dir, verbose=args.verbose
-                )
-                if args.judge:
-                    grade_kwargs["judge_model"] = args.judge
-                    grade_kwargs["judge_backend"] = "api"
-                grade = grade_task(**grade_kwargs)
-            except Exception as exc:
-                if execution_error:
-                    note = f"Execution failed: {execution_error}; Grading failed: {exc}"
-                else:
-                    note = f"Grading failed: {exc}"
-                logger.warning("Task grading failed for %s, continuing: %s", task.task_id, exc)
-                grade = GradeResult(
-                    task_id=task.task_id,
-                    score=0.0,
-                    max_score=1.0,
-                    grading_type=task.grading_type,
-                    breakdown={},
-                    notes=note,
-                )
-            task_grades.append(grade)
+
             task_results.append(result)
             results.append(result)
 
-            # Log score immediately after grading
-            score_pct = grade.score / grade.max_score * 100 if grade.max_score > 0 else 0
-            status_emoji = (
-                "✅" if grade.score >= grade.max_score else "⚠️" if grade.score > 0 else "❌"
+            # Build grade kwargs for this run
+            grade_kwargs = dict(
+                task=task, execution_result=result, skill_dir=skill_dir, verbose=args.verbose
             )
-            logger.info(
-                "%s Task %s: %.1f/%.1f (%.0f%%) - %s",
-                status_emoji,
-                task.task_id,
-                grade.score,
-                grade.max_score,
-                score_pct,
-                grade.grading_type,
+            if args.judge:
+                grade_kwargs["judge_model"] = args.judge
+                grade_kwargs["judge_backend"] = "api"
+
+            # Parallel grading: submit to background if enabled and single run
+            # For multi-run tasks, grade synchronously to maintain order
+            is_last_task = (i == len(tasks_to_run))
+            can_parallelize = (
+                use_parallel_judge
+                and judge_executor is not None
+                and runs_per_task == 1
+                and not is_last_task
             )
-            if grade.notes:
-                logger.info("   Notes: %s", grade.notes[:200])
+
+            if can_parallelize:
+                # Submit grading to background thread
+                pending_grade_future = judge_executor.submit(grade_task, **grade_kwargs)
+                pending_grade_task = task
+                pending_grade_result = result
+                logger.info("   Grading submitted to background thread")
+                # Don't wait - continue to next task
+                # Results will be recorded when we call _wait_for_pending_grade()
+                continue
+            else:
+                # Synchronous grading
+                try:
+                    grade = grade_task(**grade_kwargs)
+                except Exception as exc:
+                    if execution_error:
+                        note = f"Execution failed: {execution_error}; Grading failed: {exc}"
+                    else:
+                        note = f"Grading failed: {exc}"
+                    logger.warning("Task grading failed for %s, continuing: %s", task.task_id, exc)
+                    grade = GradeResult(
+                        task_id=task.task_id,
+                        score=0.0,
+                        max_score=1.0,
+                        grading_type=task.grading_type,
+                        breakdown={},
+                        notes=note,
+                    )
+                task_grades.append(grade)
+
+                # Log score immediately after grading
+                score_pct = grade.score / grade.max_score * 100 if grade.max_score > 0 else 0
+                status_emoji = (
+                    "✅" if grade.score >= grade.max_score else "⚠️" if grade.score > 0 else "❌"
+                )
+                logger.info(
+                    "%s Task %s: %.1f/%.1f (%.0f%%) - %s",
+                    status_emoji,
+                    task.task_id,
+                    grade.score,
+                    grade.max_score,
+                    score_pct,
+                    grade.grading_type,
+                )
+                if grade.notes:
+                    logger.info("   Notes: %s", grade.notes[:200])
+
+        # Skip grades_by_task_id update if grading was submitted to background
+        if pending_grade_future is not None and pending_grade_task == task:
+            continue
 
         task_scores = [grade.score for grade in task_grades]
         grades_by_task_id[task.task_id] = {
@@ -916,6 +1014,14 @@ def main():
         # Incremental write: update result JSON after each task so partial
         # results are available while the benchmark is still running.
         _write_incremental_results()
+
+    # Wait for any final pending background grade
+    _wait_for_pending_grade()
+
+    # Shutdown the judge executor if we used one
+    if judge_executor is not None:
+        judge_executor.shutdown(wait=True)
+        logger.info("Parallel judge executor shut down")
 
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
