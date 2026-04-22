@@ -744,7 +744,8 @@ def main():
 
     tasks_to_run = runner.tasks
     if task_ids is not None:
-        tasks_to_run = [task for task in runner.tasks if task.task_id in task_ids]
+        tasks_map = {task.task_id: task for task in runner.tasks}
+        tasks_to_run = [tasks_map[tid] for tid in task_ids if tid in tasks_map]
     tasks_by_id = {task.task_id: task for task in tasks_to_run}
 
     runs_per_task = max(1, args.runs)
