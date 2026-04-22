@@ -979,7 +979,24 @@ def main():
                     logger.info("   Notes: %s", grade.notes[:200])
 
         # Skip grades_by_task_id update if grading was submitted to background
+        # EXCEPT for sanity task - we need to wait for it to enforce fail-fast
         if pending_grade_future is not None and pending_grade_task == task:
+            if task.task_id == sanity_task_id and not args.no_fail_fast:
+                # Wait for sanity grade synchronously to check fail-fast
+                _wait_for_pending_grade()
+                # Now task_grades will be empty, but grades_by_task_id is populated
+                # Check fail-fast condition
+                if (
+                    sanity_task_id in grades_by_task_id
+                    and grades_by_task_id[sanity_task_id]["mean"] == 0.0
+                ):
+                    logger.error(
+                        "🚨 FAIL FAST: Sanity check (%s) scored 0%%. Aborting benchmark run to avoid wasting resources.",
+                        sanity_task_id,
+                    )
+                    if judge_executor is not None:
+                        judge_executor.shutdown(wait=False)
+                    sys.exit(3)
             continue
 
         task_scores = [grade.score for grade in task_grades]
