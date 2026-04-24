@@ -53,7 +53,7 @@ def grade_task(
     judge_model: str = DEFAULT_JUDGE_MODEL,
     judge_agent_prefix: str = DEFAULT_JUDGE_AGENT_PREFIX,
     judge_timeout_seconds: float = DEFAULT_JUDGE_TIMEOUT_SECONDS,
-    judge_backend: str = "openclaw",
+    judge_backend: str = "api",
     verbose: bool = False,
 ) -> GradeResult:
     grading_type = task.grading_type
@@ -185,7 +185,7 @@ def _grade_llm_judge(
     judge_model: str,
     judge_agent_prefix: str,
     judge_timeout_seconds: float,
-    judge_backend: str = "openclaw",
+    judge_backend: str = "api",
     skill_dir: Optional[Path] = None,
     verbose: bool = False,
 ) -> GradeResult:
