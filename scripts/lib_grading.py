@@ -20,7 +20,7 @@ from lib_tasks import Task
 logger = logging.getLogger(__name__)
 
 
-DEFAULT_JUDGE_MODEL = "openrouter/anthropic/claude-opus-4.5"
+DEFAULT_JUDGE_MODEL = "openrouter/anthropic/claude-haiku-4.5"
 DEFAULT_JUDGE_AGENT_PREFIX = "bench-judge"
 DEFAULT_JUDGE_TIMEOUT_SECONDS = 300
 
