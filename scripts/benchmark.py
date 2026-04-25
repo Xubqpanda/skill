@@ -34,6 +34,7 @@ from lib_agent import (
     slugify_model,
     validate_openrouter_model,
 )
+from lib_axiom import init_axiom
 from lib_grading import DEFAULT_JUDGE_TIMEOUT_SECONDS, GradeResult, grade_task
 from lib_tasks import Task, TaskLoader
 
@@ -754,6 +755,14 @@ def main():
         tasks_to_run = [tasks_map[tid] for tid in task_ids if tid in tasks_map]
     tasks_by_id = {task.task_id: task for task in tasks_to_run}
 
+    # Initialize Axiom logging (silently no-ops if AXIOM_API_TOKEN not set)
+    axiom = init_axiom(
+        run_id=run_id,
+        model=args.model,
+        benchmark_version=_get_benchmark_version(skill_root),
+    )
+    axiom.run_start(total_tasks=len(tasks_to_run), suite=args.suite)
+
     runs_per_task = max(1, args.runs)
 
     # Incremental result writer: builds partial result JSON from completed
@@ -812,6 +821,7 @@ def main():
     pending_grade_future: Optional[Future] = None
     pending_grade_task: Optional[Task] = None
     pending_grade_result: Optional[Dict[str, Any]] = None
+    pending_grade_task_num: int = 0
 
     if use_parallel_judge:
         judge_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="judge")
@@ -819,7 +829,7 @@ def main():
 
     def _wait_for_pending_grade() -> None:
         """Wait for any pending background grade to complete and record it."""
-        nonlocal pending_grade_future, pending_grade_task, pending_grade_result
+        nonlocal pending_grade_future, pending_grade_task, pending_grade_result, pending_grade_task_num
         if pending_grade_future is None:
             return
 
@@ -850,6 +860,18 @@ def main():
         )
         if grade.notes:
             logger.info("   Notes: %s", grade.notes[:200])
+
+        # Log to Axiom
+        axiom.task_complete(
+            task_id=pending_grade_task.task_id,
+            task_num=pending_grade_task_num,
+            total_tasks=len(tasks_to_run),
+            score=grade.score,
+            max_score=grade.max_score,
+            grading_type=grade.grading_type,
+            execution_time_sec=pending_grade_result.get("execution_time", 0.0),
+            timed_out=pending_grade_result.get("timed_out", False),
+        )
 
         # Record the grade
         task_scores = [grade.score]
@@ -937,6 +959,7 @@ def main():
                 pending_grade_future = judge_executor.submit(grade_task, **grade_kwargs)
                 pending_grade_task = task
                 pending_grade_result = result
+                pending_grade_task_num = i
                 logger.info("   Grading submitted to background thread")
                 # Don't wait - continue to next task
                 # Results will be recorded when we call _wait_for_pending_grade()
@@ -978,6 +1001,19 @@ def main():
                 if grade.notes:
                     logger.info("   Notes: %s", grade.notes[:200])
 
+                # Log to Axiom
+                axiom.task_complete(
+                    task_id=task.task_id,
+                    task_num=i,
+                    total_tasks=len(tasks_to_run),
+                    score=grade.score,
+                    max_score=grade.max_score,
+                    grading_type=grade.grading_type,
+                    execution_time_sec=result.get("execution_time", 0.0),
+                    timed_out=result.get("timed_out", False),
+                    error=execution_error,
+                )
+
         # Skip grades_by_task_id update if grading was submitted to background
         # EXCEPT for sanity task - we need to wait for it to enforce fail-fast
         if pending_grade_future is not None and pending_grade_task == task:
@@ -994,6 +1030,7 @@ def main():
                         "🚨 FAIL FAST: Sanity check (%s) scored 0%%. Aborting benchmark run to avoid wasting resources.",
                         sanity_task_id,
                     )
+                    axiom.sanity_failed(score=grades_by_task_id[sanity_task_id]["mean"])
                     if judge_executor is not None:
                         judge_executor.shutdown(wait=False)
                     sys.exit(3)
@@ -1021,6 +1058,7 @@ def main():
                 "🚨 FAIL FAST: Sanity check (%s) scored 0%%. Aborting benchmark run to avoid wasting resources.",
                 sanity_task_id,
             )
+            axiom.sanity_failed(score=grades_by_task_id[task.task_id]["mean"])
             sys.exit(3)
         if task.task_id == sanity_task_id and grades_by_task_id[task.task_id]["mean"] == 0.0:
             if all_runs_missing_transcript:
@@ -1088,6 +1126,9 @@ def main():
         except Exception as exc:
             logger.warning("Trend analysis failed: %s", exc)
 
+    submission_id = None
+    leaderboard_url = None
+
     if args.no_upload:
         logger.info("Skipping upload (--no-upload)")
     else:
@@ -1097,12 +1138,27 @@ def main():
             result = upload_results(output_path, official_key=args.official_key)
             if result.submission_id:
                 logger.info("Submission ID: %s", result.submission_id)
+                submission_id = result.submission_id
             if result.rank is not None:
                 logger.info("Uploaded to leaderboard: rank #%s", result.rank)
             if result.leaderboard_url:
                 logger.info("View at: %s", result.leaderboard_url)
+                leaderboard_url = result.leaderboard_url
         except UploadError as exc:
             logger.warning("Upload failed: %s", exc)
+            axiom.upload_failed(error=str(exc))
+
+    # Log run completion to Axiom
+    total_time_sec = sum(r.get("execution_time", 0.0) for r in results)
+    axiom.run_complete(
+        overall_score_pct=score_pct,
+        overall_earned=total_score,
+        overall_possible=max_score,
+        total_cost_usd=efficiency.get("total_cost_usd"),
+        total_time_sec=total_time_sec,
+        submission_id=submission_id,
+        leaderboard_url=leaderboard_url,
+    )
 
 
 if __name__ == "__main__":
