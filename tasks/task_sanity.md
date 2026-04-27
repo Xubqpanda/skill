@@ -4,7 +4,9 @@ name: Sanity Check
 category: basic
 grading_type: automated
 timeout_seconds: 60
-workspace_files: []
+workspace_files:
+  - path: BOOTSTRAP.md
+    content: ""
 ---
 
 ## Prompt
