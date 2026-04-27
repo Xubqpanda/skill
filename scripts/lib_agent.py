@@ -437,6 +437,14 @@ def prepare_task_workspace(skill_dir: Path, run_id: str, task: Task, agent_id: s
         (workspace / fname).write_bytes(content)
 
     for file_spec in task.workspace_files:
+        # Support delete: true to remove a file (e.g., BOOTSTRAP.md for sanity check)
+        if file_spec.get("delete"):
+            dest = workspace / file_spec["path"]
+            if dest.exists():
+                dest.unlink()
+                logger.info("Deleted workspace file: %s", file_spec["path"])
+            continue
+
         if "content" in file_spec:
             dest = workspace / file_spec["path"]
             dest.parent.mkdir(parents=True, exist_ok=True)
