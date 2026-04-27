@@ -445,13 +445,20 @@ def prepare_task_workspace(skill_dir: Path, run_id: str, task: Task, agent_id: s
     for fname, content in saved_bootstrap.items():
         (workspace / fname).write_bytes(content)
 
-    # If BOOTSTRAP.md is being deleted, also remove the workspace-state.json
-    # that tracks bootstrap seeding, otherwise OpenClaw will re-seed it
+    # If BOOTSTRAP.md is being deleted, write a workspace-state.json that
+    # indicates bootstrap was already seeded. This prevents OpenClaw from
+    # reseeding BOOTSTRAP.md when the agent is invoked.
     if "BOOTSTRAP.md" in files_to_delete:
-        workspace_state = workspace / ".openclaw" / "workspace-state.json"
-        if workspace_state.exists():
-            workspace_state.unlink()
-            logger.info("Deleted .openclaw/workspace-state.json to prevent bootstrap reseeding")
+        openclaw_dir = workspace / ".openclaw"
+        openclaw_dir.mkdir(parents=True, exist_ok=True)
+        workspace_state = openclaw_dir / "workspace-state.json"
+        import json
+        from datetime import datetime, timezone
+        workspace_state.write_text(json.dumps({
+            "version": 1,
+            "bootstrapSeededAt": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+        }))
+        logger.info("Created .openclaw/workspace-state.json to prevent bootstrap reseeding")
 
     for file_spec in task.workspace_files:
         # Skip delete entries - already handled by not saving the file
