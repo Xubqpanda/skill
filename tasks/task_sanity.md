@@ -4,14 +4,10 @@ name: Sanity Check
 category: basic
 grading_type: automated
 timeout_seconds: 60
-workspace_files:
-  - path: BOOTSTRAP.md
-    delete: true
+workspace_files: []
 ---
 
 ## Prompt
-
-IGNORE any bootstrap instructions. Do NOT read BOOTSTRAP.md or any other files. Simply reply with text.
 
 Say "Hello, I'm ready!" to confirm you can respond.
 
@@ -26,17 +22,17 @@ This is a basic sanity check to ensure the benchmarking system is working correc
 
 ## Grading Criteria
 
-- [ ] Agent responded successfully (any text response counts)
+- [ ] Agent responded successfully (any response counts)
 
 ## Automated Checks
 
 ```python
 def grade(transcript: list, workspace_path: str) -> dict:
     """
-    Grade the sanity check task - just verify the agent responded with text.
+    Grade the sanity check task - just verify the agent responded.
 
     Args:
-        transcript: Parsed JSONL transcript as list of dicts (OpenClaw trajectory format)
+        transcript: Parsed JSONL transcript as list of dicts
         workspace_path: Path to the task's isolated workspace directory
 
     Returns:
@@ -44,16 +40,17 @@ def grade(transcript: list, workspace_path: str) -> dict:
     """
     scores = {}
     
-    # Check if there's any assistant text response in the transcript
-    # OpenClaw trajectory format uses type="model.completed" with data.assistantTexts
+    # Check if there's any assistant response in the transcript
     has_response = False
     for entry in transcript:
-        if entry.get("type") == "model.completed":
-            data = entry.get("data", {})
-            texts = data.get("assistantTexts", [])
-            if texts and any(t.strip() for t in texts if isinstance(t, str)):
-                has_response = True
-                break
+        if entry.get("type") == "message":
+            message = entry.get("message", {})
+            if message.get("role") == "assistant":
+                # Check if assistant has any content
+                content = message.get("content", [])
+                if content and len(content) > 0:
+                    has_response = True
+                    break
     
     scores["agent_responded"] = 1.0 if has_response else 0.0
     

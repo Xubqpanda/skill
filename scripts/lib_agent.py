@@ -424,18 +424,9 @@ def prepare_task_workspace(skill_dir: Path, run_id: str, task: Task, agent_id: s
         except OSError:
             pass
 
-    # Build set of files that should be deleted according to workspace_files
-    files_to_delete = {
-        spec["path"] for spec in task.workspace_files if spec.get("delete")
-    }
-
     saved_bootstrap: dict[str, bytes] = {}
     if workspace.exists():
         for fname in _BOOTSTRAP_FILES:
-            # Don't save files that are marked for deletion
-            if fname in files_to_delete:
-                logger.info("Skipping save of %s (marked for deletion)", fname)
-                continue
             fpath = workspace / fname
             if fpath.exists():
                 saved_bootstrap[fname] = fpath.read_bytes()
@@ -445,26 +436,7 @@ def prepare_task_workspace(skill_dir: Path, run_id: str, task: Task, agent_id: s
     for fname, content in saved_bootstrap.items():
         (workspace / fname).write_bytes(content)
 
-    # If BOOTSTRAP.md is being deleted, write a workspace-state.json that
-    # indicates bootstrap was already seeded. This prevents OpenClaw from
-    # reseeding BOOTSTRAP.md when the agent is invoked.
-    if "BOOTSTRAP.md" in files_to_delete:
-        openclaw_dir = workspace / ".openclaw"
-        openclaw_dir.mkdir(parents=True, exist_ok=True)
-        workspace_state = openclaw_dir / "workspace-state.json"
-        import json
-        from datetime import datetime, timezone
-        workspace_state.write_text(json.dumps({
-            "version": 1,
-            "bootstrapSeededAt": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
-        }))
-        logger.info("Created .openclaw/workspace-state.json to prevent bootstrap reseeding")
-
     for file_spec in task.workspace_files:
-        # Skip delete entries - already handled by not saving the file
-        if file_spec.get("delete"):
-            continue
-
         if "content" in file_spec:
             dest = workspace / file_spec["path"]
             dest.parent.mkdir(parents=True, exist_ok=True)
