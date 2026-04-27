@@ -424,9 +424,18 @@ def prepare_task_workspace(skill_dir: Path, run_id: str, task: Task, agent_id: s
         except OSError:
             pass
 
+    # Build set of files that should be deleted according to workspace_files
+    files_to_delete = {
+        spec["path"] for spec in task.workspace_files if spec.get("delete")
+    }
+
     saved_bootstrap: dict[str, bytes] = {}
     if workspace.exists():
         for fname in _BOOTSTRAP_FILES:
+            # Don't save files that are marked for deletion
+            if fname in files_to_delete:
+                logger.info("Skipping save of %s (marked for deletion)", fname)
+                continue
             fpath = workspace / fname
             if fpath.exists():
                 saved_bootstrap[fname] = fpath.read_bytes()
@@ -437,12 +446,8 @@ def prepare_task_workspace(skill_dir: Path, run_id: str, task: Task, agent_id: s
         (workspace / fname).write_bytes(content)
 
     for file_spec in task.workspace_files:
-        # Support delete: true to remove a file (e.g., BOOTSTRAP.md for sanity check)
+        # Skip delete entries - already handled by not saving the file
         if file_spec.get("delete"):
-            dest = workspace / file_spec["path"]
-            if dest.exists():
-                dest.unlink()
-                logger.info("Deleted workspace file: %s", file_spec["path"])
             continue
 
         if "content" in file_spec:
