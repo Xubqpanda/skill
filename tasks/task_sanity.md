@@ -36,7 +36,7 @@ def grade(transcript: list, workspace_path: str) -> dict:
     Grade the sanity check task - just verify the agent responded with text.
 
     Args:
-        transcript: Parsed JSONL transcript as list of dicts
+        transcript: Parsed JSONL transcript as list of dicts (OpenClaw trajectory format)
         workspace_path: Path to the task's isolated workspace directory
 
     Returns:
@@ -45,19 +45,15 @@ def grade(transcript: list, workspace_path: str) -> dict:
     scores = {}
     
     # Check if there's any assistant text response in the transcript
+    # OpenClaw trajectory format uses type="model.completed" with data.assistantTexts
     has_response = False
     for entry in transcript:
-        if entry.get("type") == "message":
-            message = entry.get("message", {})
-            if message.get("role") == "assistant":
-                content = message.get("content", [])
-                # Must have actual text content, not just tool calls
-                for item in content:
-                    if item.get("type") == "text" and item.get("text", "").strip():
-                        has_response = True
-                        break
-                if has_response:
-                    break
+        if entry.get("type") == "model.completed":
+            data = entry.get("data", {})
+            texts = data.get("assistantTexts", [])
+            if texts and any(t.strip() for t in texts if isinstance(t, str)):
+                has_response = True
+                break
     
     scores["agent_responded"] = 1.0 if has_response else 0.0
     
