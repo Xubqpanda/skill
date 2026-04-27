@@ -6,7 +6,7 @@ grading_type: automated
 timeout_seconds: 60
 workspace_files:
   - path: BOOTSTRAP.md
-    delete: true
+    content: ""
 ---
 
 ## Prompt
